@@ -452,7 +452,7 @@ func assertArchiveGlobalStats(t *testing.T, d *DB, profileName, skillName, toolN
 	if tools[toolName] != 1 {
 		t.Fatalf("archive tool aggregate %q=%d, want 1", toolName, tools[toolName])
 	}
-	findings, err := d.FindingStats()
+	findings, err := d.FindingStats(FindingScope{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}

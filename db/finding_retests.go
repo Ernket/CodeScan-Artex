@@ -51,9 +51,17 @@ type ActiveFindingRetest struct {
 	Status         string `json:"status"`
 }
 
-func (d *DB) ListActiveFindingRetests(ctx context.Context) ([]ActiveFindingRetest, error) {
-	rows, err := d.QueryContext(ctx, `SELECT id, finding_id, conversation_id, status FROM finding_retests
-	WHERE status IN ('pending','running') AND conversation_id IS NOT NULL ORDER BY id`)
+// ListActiveFindingRetests returns in-flight retests visible to scope. The scope
+// predicate is expressed on tasks t, so the query joins findings → tasks like every
+// other scoped findings query (see FindingScope.apply).
+func (d *DB) ListActiveFindingRetests(ctx context.Context, scope FindingScope) ([]ActiveFindingRetest, error) {
+	conds := []string{"r.status IN ('pending','running')", "r.conversation_id IS NOT NULL"}
+	args := []any{}
+	conds, args = scope.apply(conds, args)
+	rows, err := d.QueryContext(ctx, `SELECT r.id, r.finding_id, r.conversation_id, r.status FROM finding_retests r
+	JOIN findings f ON f.id = r.finding_id
+	JOIN tasks t ON t.id = f.task_id
+	WHERE `+strings.Join(conds, " AND ")+` ORDER BY r.id`, args...)
 	if err != nil {
 		return nil, err
 	}

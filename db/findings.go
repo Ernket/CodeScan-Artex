@@ -127,23 +127,72 @@ func scanFindings(rows interface {
 	return out, rows.Err()
 }
 
-// ListFindings returns all findings (newest first), joined with task description.
-// Kept for the dashboard's summary; the paginated 发现 page uses ListFindingsPage.
-func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
+// ListFindings returns findings the scope allows (newest first), joined with task
+// description. Kept for the dashboard's summary; the paginated 发现 page uses
+// ListFindingsPage. scope is required — pass FindingScope{All: true} for the
+// unrestricted (administrator) view.
+func (d *DB) ListFindings(limit int, scope FindingScope) ([]*DBFinding, error) {
 	if limit <= 0 {
 		limit = 500
 	}
+	conds, args := scope.apply(nil, nil)
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+	args = append(args, limit)
 	rows, err := d.Query(`
 		SELECT `+findingSelectCols+`
 		FROM findings f
-		LEFT JOIN tasks t ON f.task_id = t.id
+		LEFT JOIN tasks t ON f.task_id = t.id`+where+`
 		ORDER BY f.created_at DESC
-		LIMIT $1`, limit)
+		LIMIT $`+strconv.Itoa(len(args)), args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanFindings(rows)
+}
+
+// FindingScope narrows a findings query to the accounts allowed to see a finding.
+// A finding is visible when its owning task belongs to one of DepartmentIDs or was
+// created by UserID; All=true means unrestricted (administrator).
+//
+// Findings whose owning task is absent (task_id NULL, or the task row is gone — the FK
+// is ON DELETE SET NULL) match neither branch and are therefore administrator-only.
+// That mirrors the existing policy in DeleteDepartment: revoked tasks stay visible only
+// to administrators and their creator.
+//
+// An empty scope (no departments, no user, All=false) matches nothing. Emitting an
+// explicit FALSE there is load-bearing: returning no condition would expose every row.
+type FindingScope struct {
+	All           bool
+	DepartmentIDs []int64
+	UserID        int64
+}
+
+// apply appends the visibility predicate to conds, continuing positional numbering from
+// args. Every findings query that uses it must join tasks t.
+func (s FindingScope) apply(conds []string, args []any) ([]string, []any) {
+	if s.All {
+		return conds, args
+	}
+	switch {
+	case len(s.DepartmentIDs) == 0 && s.UserID <= 0:
+		// No membership and no own tasks: match nothing.
+		return append(conds, "FALSE"), args
+	case len(s.DepartmentIDs) > 0 && s.UserID > 0:
+		// Both branches are an OR — they must be one condition, since where() ANDs.
+		args = append(args, s.DepartmentIDs, s.UserID)
+		conds = append(conds, fmt.Sprintf("(t.department_id = ANY($%d) OR t.created_by = $%d)", len(args)-1, len(args)))
+	case len(s.DepartmentIDs) > 0:
+		args = append(args, s.DepartmentIDs)
+		conds = append(conds, fmt.Sprintf("t.department_id = ANY($%d)", len(args)))
+	default:
+		args = append(args, s.UserID)
+		conds = append(conds, fmt.Sprintf("t.created_by = $%d", len(args)))
+	}
+	return conds, args
 }
 
 // FindingFilter narrows a paginated findings query. Empty-string fields mean "no
@@ -159,6 +208,10 @@ type FindingFilter struct {
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
+
+	// Scope 是部门可见性范围,由服务层根据当前账号计算(见 server.findingScopeFor)。
+	// 零值表示「什么都看不到」,不是「不过滤」。
+	Scope FindingScope
 
 	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
 	assetIDs  []int64 // 子树里所有资产 id
@@ -225,6 +278,8 @@ func (f FindingFilter) where() (string, []any) {
 			COALESCE(f.report, '') ILIKE %s ESCAPE '\'
 		)`, placeholder, placeholder, placeholder, placeholder, placeholder))
 	}
+	// 部门可见性:必须 AND 进来,且不可省略——零值 scope 会解析成 FALSE(见 FindingScope)。
+	conds, args = f.Scope.apply(conds, args)
 	if len(conds) == 0 {
 		return "", args
 	}
@@ -481,10 +536,18 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 			ph[i] = fmt.Sprintf("$%d", i+1)
 			args = append(args, id)
 		}
+		// 勾选导出走 id 精确匹配、不看 filter,但可见性范围必须照样生效:否则任何登录
+		// 账号只要猜到 finding id 就能导出任意部门的漏洞全文(含 report 正文)。
+		conds, scopedArgs := f.Scope.apply(nil, args)
+		args = scopedArgs
+		vis := ""
+		if len(conds) > 0 {
+			vis = " AND " + strings.Join(conds, " AND ")
+		}
 		q = `SELECT ` + cols + `
 			FROM findings f
 			LEFT JOIN tasks t ON f.task_id = t.id
-			WHERE f.id IN (` + strings.Join(ph, ",") + `)
+			WHERE f.id IN (` + strings.Join(ph, ",") + `)` + vis + `
 			` + order
 	} else {
 		scoped, err := d.applyAssetScope(f)
@@ -545,22 +608,41 @@ type FindingTaskOption struct {
 	Count       int    `json:"count"`
 }
 
-// FindingStats returns whole-table counts (by severity + pending) and the sorted
-// set of distinct vuln classes.
-func (d *DB) FindingStats() (*FindingStats, error) {
+// FindingStats returns counts (by severity + pending) and the sorted set of distinct
+// vuln classes, restricted to what scope may see. scope is required — pass
+// FindingScope{All: true} for the unrestricted (administrator) view.
+//
+// 注意:归档任务的冷聚合(archivedTaskAggregates)没有部门维度,无法按范围过滤,因此
+// 只对管理员计入。否则受限用户会看到「列表是空的、卡片数字却是上万」。
+func (d *DB) FindingStats(scope FindingScope) (*FindingStats, error) {
 	st := &FindingStats{VulnClasses: []string{}, Tasks: []FindingTaskOption{}}
+
+	conds, args := scope.apply(nil, nil)
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
 	err := d.QueryRow(`SELECT
 		COUNT(*),
-		COUNT(*) FILTER (WHERE status = 'pending'),
-		COUNT(*) FILTER (WHERE severity = 'critical'),
-		COUNT(*) FILTER (WHERE severity = 'high'),
-		COUNT(*) FILTER (WHERE severity = 'medium'),
-		COUNT(*) FILTER (WHERE severity = 'low')
-		FROM findings`).Scan(&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low)
+		COUNT(*) FILTER (WHERE f.status = 'pending'),
+		COUNT(*) FILTER (WHERE f.severity = 'critical'),
+		COUNT(*) FILTER (WHERE f.severity = 'high'),
+		COUNT(*) FILTER (WHERE f.severity = 'medium'),
+		COUNT(*) FILTER (WHERE f.severity = 'low')
+		FROM findings f
+		LEFT JOIN tasks t ON f.task_id = t.id`+where, args...).
+		Scan(&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.Query(`SELECT DISTINCT vulnclass FROM findings WHERE vulnclass <> '' ORDER BY vulnclass`)
+
+	// 漏洞类型下拉:同样按可见范围收敛(基础条件是「非空类型」)。
+	vconds := append([]string{"f.vulnclass <> ''"}, conds...)
+	vargs := args
+	rows, err := d.Query(`SELECT DISTINCT f.vulnclass FROM findings f
+		LEFT JOIN tasks t ON f.task_id = t.id
+		WHERE `+strings.Join(vconds, " AND ")+`
+		ORDER BY f.vulnclass`, vargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -577,12 +659,13 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	}
 
 	// 任务下拉:有漏洞的任务,带描述(任务删除后为空,前端回退 id)和条数,最新有漏洞的排前。
+	tconds, targs := scope.apply([]string{"f.task_id IS NOT NULL"}, nil)
 	trows, err := d.Query(`SELECT f.task_id, COALESCE(t.name, ''), COALESCE(t.description, ''), COUNT(*)
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
-		WHERE f.task_id IS NOT NULL
+		WHERE `+strings.Join(tconds, " AND ")+`
 		GROUP BY f.task_id, t.name, t.description
-		ORDER BY MAX(f.created_at) DESC`)
+		ORDER BY MAX(f.created_at) DESC`, targs...)
 	if err != nil {
 		return nil, err
 	}
@@ -597,34 +680,57 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	if err := trows.Err(); err != nil {
 		return nil, err
 	}
-	archived, err := d.archivedTaskAggregates()
-	if err != nil {
-		return nil, err
-	}
-	vulnclasses := make(map[string]bool, len(st.VulnClasses))
-	for _, vulnclass := range st.VulnClasses {
-		vulnclasses[vulnclass] = true
-	}
-	for _, aggregate := range archived {
-		cold := aggregate.FindingStats
-		st.Total += cold.Total
-		st.Pending += cold.Pending
-		st.Critical += cold.Critical
-		st.High += cold.High
-		st.Medium += cold.Medium
-		st.Low += cold.Low
-		for _, vulnclass := range cold.VulnClasses {
-			if vulnclass != "" {
-				vulnclasses[vulnclass] = true
+
+	// 冷聚合无部门维度 → 仅管理员计入。
+	if scope.All {
+		archived, err := d.archivedTaskAggregates()
+		if err != nil {
+			return nil, err
+		}
+		vulnclasses := make(map[string]bool, len(st.VulnClasses))
+		for _, vulnclass := range st.VulnClasses {
+			vulnclasses[vulnclass] = true
+		}
+		for _, aggregate := range archived {
+			cold := aggregate.FindingStats
+			st.Total += cold.Total
+			st.Pending += cold.Pending
+			st.Critical += cold.Critical
+			st.High += cold.High
+			st.Medium += cold.Medium
+			st.Low += cold.Low
+			for _, vulnclass := range cold.VulnClasses {
+				if vulnclass != "" {
+					vulnclasses[vulnclass] = true
+				}
 			}
 		}
+		st.VulnClasses = st.VulnClasses[:0]
+		for vulnclass := range vulnclasses {
+			st.VulnClasses = append(st.VulnClasses, vulnclass)
+		}
+		sort.Strings(st.VulnClasses)
 	}
-	st.VulnClasses = st.VulnClasses[:0]
-	for vulnclass := range vulnclasses {
-		st.VulnClasses = append(st.VulnClasses, vulnclass)
-	}
-	sort.Strings(st.VulnClasses)
 	return st, nil
+}
+
+// FindingVisible reports whether scope may see the finding with this id, using exactly
+// the same predicate as the list queries — so a detail view can never exceed the list.
+func (d *DB) FindingVisible(id int64, scope FindingScope) (bool, error) {
+	conds, args := scope.apply(nil, nil)
+	where := ""
+	if len(conds) > 0 {
+		where = " AND " + strings.Join(conds, " AND ")
+	}
+	args = append(args, id)
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM findings f
+		LEFT JOIN tasks t ON f.task_id = t.id
+		WHERE f.id = $`+strconv.Itoa(len(args))+where, args...).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // GetFinding returns a single finding row (with task_description joined and the

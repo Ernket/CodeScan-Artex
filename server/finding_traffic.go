@@ -118,6 +118,16 @@ func (s *Server) findingTrafficAccess(w http.ResponseWriter, r *http.Request, wr
 		writeErr(w, 404, "finding not found")
 		return 0, false
 	}
+	// 部门可见性：发现的可见范围跟随其所属任务（与任务列表同一套部门模型）。不可见按
+	// 不存在处理，不暴露「存在但无权查看」；写操作还要求对该任务有写权限（部门访客只读）。
+	// /traffic、/packets、/packet 这几族接口都从这里进入，校验放在这里即覆盖全部读写分支。
+	if write {
+		if !s.requireFindingWrite(w, r, id) {
+			return 0, false
+		}
+	} else if !s.requireFindingRead(w, r, id) {
+		return 0, false
+	}
 	if taskID := r.URL.Query().Get("context_task"); taskID != "" {
 		task := s.m.ResolveTask(taskID)
 		if task == nil {

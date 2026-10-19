@@ -977,10 +977,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
 
-	// /api/* goes through CORS + JWT + 任务级部门权限守卫; everything else is served by
-	// the embedded frontend (public — auth is enforced client-side and on the API).
-	// With the no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(s.guardTaskAccess(mux)))
+	// /api/* goes through CORS + JWT + 平台管理区守卫 + 任务级部门权限守卫;
+	// everything else is served by the embedded frontend (public — auth is enforced
+	// client-side and on the API). With the no-embed build the webui handler just
+	// 404s (run `next dev` separately).
+	api := cors(s.requireAuth(s.guardAdminAreas(s.guardTaskAccess(mux))))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -1015,8 +1016,10 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	// resolve the task: explicit ?task=<id> binds to that task (so a detail view
 	// never silently follows a globally-changed active task); empty = active.
 	taskParam := r.URL.Query().Get("task")
-	t := s.m.ResolveTask(taskParam)
-	if t == nil {
+	// 可见性校验:看不到该任务时,不能把它的统计给出去;空参数会落到活动任务,
+	// 无权查看活动任务的账号同样只拿全局字段。
+	t, ok := s.resolveVisibleTask(currentUser(r), taskParam)
+	if !ok || t == nil {
 		if taskParam != "" && taskParam != "active" {
 			writeErr(w, 404, "task not found")
 			return
@@ -2035,7 +2038,7 @@ func (s *Server) taskScopeDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) frontier(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeJSON(w, 200, []any{})
 		return
@@ -2052,8 +2055,10 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	if taskParam == "" {
 		// 带 page/limit → 服务端分页 {items,total,...}；不带 → 裸数组（dashboard 汇总用，
 		// 与 intents 端点的兼容策略一致）。筛选/排序统一下推到 SQL。
+		// scope 由当前账号的部门归属算出：无部门访客拿到空范围，而不是全量漏洞。
+		scope := s.findingScopeForRequest(r)
 		if q.Get("page") == "" && q.Get("limit") == "" {
-			fs, _ := s.m.pg.ListFindings(500)
+			fs, _ := s.m.pg.ListFindings(500, scope)
 			assets := s.resolveFindingAssets(fs)
 			out := make([]FindingDTO, 0, len(fs))
 			for _, f := range fs {
@@ -2064,7 +2069,9 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		}
 		page := findingPaginationParam(q.Get("page"), 1, 0)
 		limit := findingPaginationParam(q.Get("limit"), 20, 200)
-		fs, total, err := s.m.pg.ListFindingsPage(findingFilterFromQuery(q), page, limit)
+		filter := findingFilterFromQuery(q)
+		filter.Scope = scope
+		fs, total, err := s.m.pg.ListFindingsPage(filter, page, limit)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -2077,8 +2084,10 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"items": out, "total": total, "page": page, "page_size": limit})
 		return
 	}
-	t := s.m.ResolveTask(taskParam)
-	if t == nil {
+	// 带 task 参数：必须校验该任务对当前账号可见，否则访客遍历 task id 就能读任意
+	// 任务的发现（与 §4.3 的 ?task= 收敛同一规则）。
+	t, ok := s.resolveVisibleTask(currentUser(r), taskParam)
+	if !ok || t == nil {
 		writeJSON(w, 200, []any{})
 		return
 	}
@@ -2178,10 +2187,10 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 	return assets
 }
 
-// findingStats serves the whole-table aggregates (stat cards + vuln-class filter)
-// for the paginated 发现 page.
+// findingStats serves the aggregates (stat cards + vuln-class filter) for the
+// paginated 发现 page, restricted to what the current account may see.
 func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.m.pg.FindingStats()
+	st, err := s.m.pg.FindingStats(s.findingScopeForRequest(r))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2195,6 +2204,10 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	// 部门可见性:不可见按 404,不暴露「存在但无权查看」。
+	if !s.requireFindingRead(w, r, id) {
 		return
 	}
 	f, err := s.m.pg.GetFinding(id)
@@ -2266,6 +2279,9 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 可见性范围对三种 scope 都必须生效:selected 走 id 精确匹配、all 不带任何
+	// filter,但都只能导出当前账号有权看到的发现(见 FindingScope / ListFindingsForExport)。
+	filter.Scope = s.findingScopeForRequest(r)
 	fs, err := s.m.pg.ListFindingsForExport(filter, ids)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2358,6 +2374,10 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
+	// 部门可见性:不可见按 404。
+	if !s.requireFindingRead(w, r, id) {
+		return
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2393,6 +2413,10 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	// 写权限:部门访客只读,不能改发现状态/等级。
+	if !s.requireFindingWrite(w, r, id) {
 		return
 	}
 	var body struct {
@@ -2487,6 +2511,10 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
+	// 写权限:部门访客只读,不能删除发现。
+	if !s.requireFindingWrite(w, r, id) {
+		return
+	}
 	n, err := s.m.pg.DeleteFinding(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2500,7 +2528,7 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		// Back-compat: bare list shape when the task can't be resolved.
 		writeJSON(w, 200, []any{})
@@ -2625,7 +2653,7 @@ func taskIntentHistoryPage(store *db.ExplorationStore, before int64, limit int, 
 
 // explorationGraph returns the whole exploration chain (task graph) as nodes+edges.
 func (s *Server) explorationGraph(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeJSON(w, 200, map[string]any{"nodes": []any{}, "edges": []any{}})
 		return
@@ -2674,7 +2702,7 @@ func (s *Server) explorationNodes(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := atoiDefault(q.Get("page"), 1)
 	size := atoiDefault(q.Get("size"), 20)
-	t := s.m.ResolveTask(q.Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeJSON(w, 200, map[string]any{
 			"items": []any{}, "total": 0, "page": page, "size": size,
@@ -2774,7 +2802,7 @@ func csvValues(s string) []string {
 
 // activity returns the worker execution step log (incremental via ?since=seq).
 func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeJSON(w, 200, map[string]any{"items": []any{}, "cursor": 0})
 		return
@@ -2885,7 +2913,7 @@ func activitySessionStore(t *Task, filter db.ActivitySessionFilter) (*db.Explora
 // it to open the single task SSE at since=snapshot_cursor so history (id<=cursor) and
 // the live tail (id>cursor) meet with no gap and no overlap.
 func (s *Server) activityHistory(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "task not found")
 		return
@@ -2959,7 +2987,7 @@ func (s *Server) activityHistory(w http.ResponseWriter, r *http.Request) {
 // tokenStats returns per-worker token usage (input/output/cache read/write) for a
 // task — main agent, planner, and each work#N.
 func (s *Server) tokenStats(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeJSON(w, 200, map[string]any{
 			"workers":  []db.TokenUsage{},
@@ -3127,7 +3155,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "task not found")
 		return
@@ -3226,7 +3254,7 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 
 // activityDetail lazily returns the full detail blob for one step.
 func (s *Server) activityDetail(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "no task")
 		return
@@ -3768,7 +3796,7 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 // mainSessions lists the task's main-agent conversation segments (newest-first) and
 // the current one. The frontend renders these as switchable sessions under 主 Agent.
 func (s *Server) mainSessions(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "task not found")
 		return
@@ -3789,7 +3817,7 @@ func (s *Server) mainSessions(w http.ResponseWriter, r *http.Request) {
 // counter advances — the task's exploration graph, assets and goal are untouched, so
 // the main agent continues over the same task with a clean transcript/context.
 func (s *Server) newMainSession(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "task not found")
 		return
@@ -3807,7 +3835,7 @@ func (s *Server) newMainSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "no active task")
 		return
@@ -3989,7 +4017,7 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 }
 
 func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeErr(w, 404, "no active task")
 		return
@@ -4012,7 +4040,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	t := s.taskFromQuery(r)
 	if t == nil {
 		writeJSON(w, 200, []any{})
 		return

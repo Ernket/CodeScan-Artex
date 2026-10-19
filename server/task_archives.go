@@ -480,10 +480,53 @@ func (s *Server) queueTaskArchive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, item)
 }
 
+// requireArchiveTaskWrite 校验当前账号对「归档所对应的任务」是否有写权限。
+//
+// 恢复/删除归档走的是 /api/task-archives/{id} 与 /api/task-archives/{action}/batch：
+// 路径和请求体里都只有归档 id，没有任务 id，所以 guardTaskAccess 的路径正则覆盖不到，
+// 必须由归档记录反查任务再判权限——口径与 queueTaskArchivesBatch 的 requireBatchTaskWrite
+// 保持一致（部门访客只读，归档/恢复/删除都算修改任务）。
+// 任务不在内存里时非管理员一律拒绝：归档任务本就从 manager 卸载，拿不到它的部门与创建者
+// 就没有依据判权限，默认拒绝好过放行（与 guardTaskAccess 同款兜底）。
+func (s *Server) requireArchiveTaskWrite(w http.ResponseWriter, r *http.Request, archiveID int64) bool {
+	u := currentUser(r)
+	if u == nil {
+		writeErr(w, 401, "未授权")
+		return false
+	}
+	// 管理员不受限：保持改造前的行为完全不变（归档不存在仍由各 handler 自己报错）。
+	if u.IsAdmin {
+		return true
+	}
+	archive, err := s.m.pg.GetTaskArchive(archiveID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return false
+	}
+	if archive == nil {
+		writeErr(w, 404, "归档不存在")
+		return false
+	}
+	t, ok := s.m.Task(strconv.FormatInt(archive.TaskID, 10))
+	if !ok || t == nil {
+		writeErr(w, 403, "需要管理员权限")
+		return false
+	}
+	if !s.taskWriteAllowed(u, t) {
+		writeErr(w, 403, "只读权限：部门访客不能修改或控制任务（任务 #"+t.ID+"）")
+		return false
+	}
+	return true
+}
+
 func (s *Server) queueTaskArchiveRestore(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok {
 		writeErr(w, 400, "归档 id 无效")
+		return
+	}
+	// 部门访客只读：恢复归档会把任务改回来，先由归档反查任务校验写权限。
+	if !s.requireArchiveTaskWrite(w, r, id) {
 		return
 	}
 	item, err := s.m.pg.QueueTaskArchiveRestore(id)
@@ -499,6 +542,10 @@ func (s *Server) queueTaskArchiveDelete(w http.ResponseWriter, r *http.Request) 
 	id, ok := pathInt(r, "id")
 	if !ok {
 		writeErr(w, 400, "归档 id 无效")
+		return
+	}
+	// 部门访客只读：删除归档同样是修改任务，先由归档反查任务校验写权限。
+	if !s.requireArchiveTaskWrite(w, r, id) {
 		return
 	}
 	item, err := s.m.pg.QueueTaskArchiveDelete(id)
@@ -564,6 +611,13 @@ func (s *Server) queueTaskArchiveActionBatch(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	// 部门访客只读：批量恢复/删除同样逐个由归档反查任务校验写权限。有一个不允许就整批
+	// 拒绝——与批量归档同口径，静默跳过会让用户以为操作成功了。
+	for _, id := range ids {
+		if !s.requireArchiveTaskWrite(w, r, id) {
+			return
+		}
 	}
 	ids = s.orderColdTaskArchiveBatch(ids, action == "restore")
 	items := make([]archiveBatchItem, 0, len(ids))

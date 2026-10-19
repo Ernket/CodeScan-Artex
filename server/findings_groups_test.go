@@ -15,6 +15,14 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
+// deepenAsAdmin marks the request as an administrator. The findings API is now
+// scoped by department visibility (requireFindingWrite), so the deepen cases that
+// exercise business logic must run as an unrestricted account — the same access
+// these tests implicitly assumed before the scoping was added.
+func deepenAsAdmin(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), authCtxKey{}, &db.User{ID: 1, IsAdmin: true}))
+}
+
 func TestFindingPaginationParam(t *testing.T) {
 	for _, test := range []struct {
 		raw, name             string
@@ -182,7 +190,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", body)
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec := httptest.NewRecorder()
-	s.deepenFinding(rec, req)
+	s.deepenFinding(rec, deepenAsAdmin(req))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("deepen status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -247,7 +255,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", bytes.NewBufferString(`{"description":"retry"}`))
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec = httptest.NewRecorder()
-	s.deepenFinding(rec, req)
+	s.deepenFinding(rec, deepenAsAdmin(req))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("deleted origin status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -322,7 +330,7 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 		bytes.NewBufferString(`{"description":"this intent must be rolled back"}`))
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec := httptest.NewRecorder()
-	s.deepenFinding(rec, req)
+	s.deepenFinding(rec, deepenAsAdmin(req))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}

@@ -24,7 +24,10 @@ func (s *Server) listActiveFindingRetests(w http.ResponseWriter, r *http.Request
 	if pg == nil {
 		return
 	}
-	items, err := pg.ListActiveFindingRetests(r.Context())
+	// 部门可见性：进行中的复核也要按「发现 → 任务」收敛，否则任意账号都能看到全平台
+	// 正在跑的复核。findingScopeForRequest 内部已 fail-closed（解析失败返回空作用域）。
+	scope := s.findingScopeForRequest(r)
+	items, err := pg.ListActiveFindingRetests(r.Context(), scope)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -40,6 +43,10 @@ func (s *Server) listFindingRetests(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok || id <= 0 {
 		writeErr(w, 400, "bad finding id")
+		return
+	}
+	// 部门可见性：发现的可见范围跟随其所属任务；不可见按不存在处理。
+	if !s.requireFindingRead(w, r, id) {
 		return
 	}
 	f, err := pg.GetFinding(id)
@@ -78,6 +85,10 @@ func (s *Server) startFindingRetest(w http.ResponseWriter, r *http.Request) {
 	req.Notes = strings.TrimSpace(req.Notes)
 	if utf8.RuneCountInString(req.Notes) > 4000 {
 		writeErr(w, 400, "复测补充说明最多 4000 个字符")
+		return
+	}
+	// 部门访客只读：发起复测会写入复测记录并起会话，按写权限校验。
+	if !s.requireFindingWrite(w, r, id) {
 		return
 	}
 	f, err := pg.GetFinding(id)

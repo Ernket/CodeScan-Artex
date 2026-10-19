@@ -40,10 +40,21 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 	}
 }
 
+// findingFilterFor builds the shared findings filter for a request with the caller's
+// department visibility applied. User-facing queries must go through this, never
+// findingFilterFromQuery alone — the latter carries a zero FindingScope, which means
+// "see nothing", and forgetting to set it is exactly how the 发现 page leaked every
+// department's findings.
+func (s *Server) findingFilterFor(r *http.Request) db.FindingFilter {
+	f := findingFilterFromQuery(r.URL.Query())
+	f.Scope = s.findingScopeForRequest(r)
+	return f
+}
+
 // findingAssetTree serves the「按资产」view's left-hand tree: every asset that
 // carries at least one matching finding, plus the ancestors needed to place it.
 func (s *Server) findingAssetTree(w http.ResponseWriter, r *http.Request) {
-	tree, err := s.m.pg.BuildFindingAssetTree(findingFilterFromQuery(r.URL.Query()))
+	tree, err := s.m.pg.BuildFindingAssetTree(s.findingFilterFor(r))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -59,7 +70,7 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := findingPaginationParam(q.Get("page"), 1, 0)
 	limit := findingPaginationParam(q.Get("limit"), 10, 100)
-	groups, total, findingTotal, err := s.m.pg.ListFindingGroups(findingFilterFromQuery(q), page, limit)
+	groups, total, findingTotal, err := s.m.pg.ListFindingGroups(s.findingFilterFor(r), page, limit)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -115,6 +126,12 @@ func (s *Server) deepenFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	case utf8.RuneCountInString(description) > maxFindingFollowUpRunes:
 		writeErr(w, 400, fmt.Sprintf("description must be at most %d characters", maxFindingFollowUpRunes))
+		return
+	}
+
+	// 部门访客只读：深入利用会建意图并复活/排队来源任务，按写权限校验。放在入参校验
+	// 之后，让明显非法的请求仍按 400/413 报错，也避免为无效请求查库。
+	if !s.requireFindingWrite(w, r, id) {
 		return
 	}
 

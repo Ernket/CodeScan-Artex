@@ -26,16 +26,17 @@ import { NavMain } from "./nav-main";
 import { NavUser } from "./nav-user";
 
 // canSeeNavItem 判断当前账号是否该看到某个导航入口：
-// - adminOnly（账号管理 / 部门管理）：只有能管账号的管理员才显示；
+// - adminOnly（系统区 / 工作空间 / 资产同步 / 账号与部门管理）：只有管理员才显示；
 // - requires：直接查对应权限（访客没有 can_chat，就看不到对话入口）。
 // 仅仅是「不把无权入口摆出来」，后端每个接口仍独立校验权限。
 export function canSeeNavItem(
   item: Pick<NavMainItem, "adminOnly" | "requires">,
   permissions: Permissions | undefined,
 ): boolean {
-  // 权限未知（mock demo、或接口没返回权限体）时不隐藏：前端藏入口只是体验优化，
-  // 真正的边界在后端，没必要因为暂时拿不到权限把界面清空。
-  if (!permissions) return true;
+  // 权限未知时按 fail-closed 处理：管理类入口一律不显示（避免接口还没回来时闪出
+  // 无权入口），普通入口照常显示——否则首屏会把侧边栏清空，体验很差。真正的边界
+  // 始终在后端。
+  if (!permissions) return !item.adminOnly;
   if (item.adminOnly && !permissions.can_manage_users) return false;
   if (item.requires && !permissions[item.requires]) return false;
   return true;

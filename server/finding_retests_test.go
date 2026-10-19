@@ -82,6 +82,9 @@ func setRetestProvider(s *Server, p retestProvider) {
 func retestRequest(handler http.HandlerFunc, method string, id int64, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, "/", strings.NewReader(body))
 	r.SetPathValue("id", strconv.FormatInt(id, 10))
+	// 发现接口现在按部门可见性收敛（requireFindingRead/Write）：这些用例校验的是复测
+	// 流程本身，所以按管理员（不受限）调用，与改造前的行为一致。
+	r = r.WithContext(context.WithValue(r.Context(), authCtxKey{}, &db.User{ID: 1, IsAdmin: true}))
 	w := httptest.NewRecorder()
 	handler(w, r)
 	return w

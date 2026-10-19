@@ -23,6 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context";
 import type {
   Activity,
   Agent,
@@ -159,6 +160,12 @@ function SectionTitle({
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
+  // 仪表盘按权限展示：系统配置 / 拦截待审 / 流量 / Agent / MCP / Skill / 工具 / LLM 配置
+  // 都是管理员专属接口（server/policy.go），非管理员既不请求也不渲染对应卡片——否则
+  // 后端收紧权限后，非管理员一登录就会看到满屏 403 报错。
+  const { user, permissions } = useAuth();
+  const isAdmin = user?.is_admin === true || permissions?.can_manage_users === true;
+
   // data state
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
@@ -209,6 +216,8 @@ export default function DashboardPage() {
   }, []);
 
   // The remaining fast sources stay batched so one poll causes a single render.
+  // 系统配置 / 拦截待审是管理员专属接口（server/policy.go），非管理员不再请求：
+  // 否则登录后仪表盘会连发一串注定 403 的请求，非管理员一进来就看到满屏报错。
   React.useEffect(() => {
     let alive = true;
     let loading = false;
@@ -216,17 +225,20 @@ export default function DashboardPage() {
       if (loading) return;
       loading = true;
       try {
-        const [findings, stats, settings, pending, activity, tokens, conversationTokens] = await Promise.all([
+        const [findings, stats, activity, tokens, conversationTokens] = await Promise.all([
           api.findings(),
           api.stats(),
-          api.settings(),
-          api.interceptPending(),
           // 跨任务的最新事件。api.activity(undefined) 会落到「当前活动任务」并从最旧
           // 开始扫描，仪表盘上显示的是几小时前的老事件。
           api.recentActivity(30),
           api.tokenStats(),
           api.conversationTokens(),
         ]);
+        let settings: Settings | null = null;
+        let pending: InterceptPending[] = [];
+        if (isAdmin) {
+          [settings, pending] = await Promise.all([api.settings(), api.interceptPending()]);
+        }
         if (!alive) return;
         setFindings(findings);
         setStats(stats);
@@ -247,32 +259,34 @@ export default function DashboardPage() {
       alive = false;
       clearInterval(timer);
     };
-  }, []);
+  }, [isAdmin]);
 
   // slow poll: traffic, assets, system-static (every 15s)
+  // 流量 / Agent / MCP / Skill / 工具 / LLM 配置都是管理员专属接口，非管理员跳过。
   React.useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
-        const [traf, counts, agentList, mcpList, skillList, toolList, profileList, usage] = await Promise.all([
+        const [counts, usage] = await Promise.all([api.assetCounts(), api.usageStats(365)]);
+        if (!alive) return;
+        setAssetCounts(counts ?? {});
+        setUsageStats(usage);
+        if (!isAdmin) return;
+        const [traf, agentList, mcpList, skillList, toolList, profileList] = await Promise.all([
           api.traffic(0, 50),
-          api.assetCounts(),
           api.agents(),
           api.mcpServers(),
           api.skills(),
           api.tools(),
           api.llmProfiles(),
-          api.usageStats(365),
         ]);
         if (!alive) return;
         setTraffic(traf.exchanges ?? []);
-        setAssetCounts(counts ?? {});
         setAgents(agentList);
         setMcpServers(mcpList);
         setSkills(skillList);
         setTools(toolList);
         setLLMProfiles(profileList);
-        setUsageStats(usage);
       } catch {
         /* transient errors */
       }
@@ -283,7 +297,7 @@ export default function DashboardPage() {
       alive = false;
       clearInterval(t);
     };
-  }, []);
+  }, [isAdmin]);
 
   // ── derived ───────────────────────────────────────────────────────────────
 
@@ -934,10 +948,7 @@ export default function DashboardPage() {
                     <Badge variant="outline" className="px-1.5 py-0 text-[9px] text-muted-foreground">
                       {a.kind}
                     </Badge>
-                    <div
-                      className="mt-0.5 text-[9px] tabular-nums text-muted-foreground"
-                      title={fmtExact(a.ts)}
-                    >
+                    <div className="mt-0.5 text-[9px] tabular-nums text-muted-foreground" title={fmtExact(a.ts)}>
                       {fmtRel(a.ts, now)}
                     </div>
                   </div>
@@ -985,10 +996,7 @@ export default function DashboardPage() {
                       {f.summary}
                     </div>
                   </div>
-                  <span
-                    className="shrink-0 text-[9px] tabular-nums text-muted-foreground"
-                    title={fmtExact(f.ts)}
-                  >
+                  <span className="shrink-0 text-[9px] tabular-nums text-muted-foreground" title={fmtExact(f.ts)}>
                     {fmtRel(f.ts, now)}
                   </span>
                 </div>
@@ -1121,134 +1129,138 @@ export default function DashboardPage() {
           <div className="mt-3 border-t pt-3 text-[10px] text-muted-foreground">共 {totalAssets} 节点</div>
         </Card>
 
-        {/* 流量状态码 */}
-        <Card className="p-4">
-          <SectionTitle icon={ActivityIcon} sub={`${traffic.length} 次请求`}>
-            流量状态码
-          </SectionTitle>
+        {/* 流量状态码 —— /api/traffic 是管理员接口，非管理员不渲染该卡片 */}
+        {isAdmin && (
+          <Card className="p-4">
+            <SectionTitle icon={ActivityIcon} sub={`${traffic.length} 次请求`}>
+              流量状态码
+            </SectionTitle>
 
-          {/* bar chart */}
-          {trafficByCodes.length === 0 ? (
-            <div className="py-6 text-center text-xs text-muted-foreground">暂无流量数据</div>
-          ) : (
-            <>
-              <div className="mb-3 flex items-end gap-2" style={{ height: 52 }}>
-                {trafficByCodes.map(({ code, n }) => (
-                  <div key={code} className="flex flex-1 flex-col items-center gap-1">
-                    <span className="text-[9px] tabular-nums text-muted-foreground">{n}</span>
-                    <div
-                      className={cn("w-full min-h-1 rounded-sm", statusBg(code), "opacity-80")}
-                      style={{ height: Math.max(4, (n / trafficMax) * 36) }}
-                    />
-                    <span className={cn("text-[9px] font-mono", statusColor(code))}>{code}</span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="border-t pt-2.5">
-                <div className="mb-1.5 text-[10px] text-muted-foreground">最近请求</div>
-                <div className="flex flex-col gap-1.5">
-                  {recentTraffic.map((e) => (
-                    <div key={e.id} className="flex items-center gap-1.5 text-[10px]">
-                      <span
-                        className={cn(
-                          "shrink-0 rounded border px-1 py-0 font-mono text-[9px]",
-                          e.method === "GET"
-                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                            : "border-blue-500/30 bg-blue-500/10 text-blue-400",
-                        )}
-                      >
-                        {e.method}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                        {e.host}
-                        {e.url.replace(/^https?:\/\/[^/]+/, "").substring(0, 30)}
-                      </span>
-                      <span className={cn("shrink-0 font-mono text-[9px]", statusColor(e.status))}>{e.status}</span>
+            {/* bar chart */}
+            {trafficByCodes.length === 0 ? (
+              <div className="py-6 text-center text-xs text-muted-foreground">暂无流量数据</div>
+            ) : (
+              <>
+                <div className="mb-3 flex items-end gap-2" style={{ height: 52 }}>
+                  {trafficByCodes.map(({ code, n }) => (
+                    <div key={code} className="flex flex-1 flex-col items-center gap-1">
+                      <span className="text-[9px] tabular-nums text-muted-foreground">{n}</span>
+                      <div
+                        className={cn("w-full min-h-1 rounded-sm", statusBg(code), "opacity-80")}
+                        style={{ height: Math.max(4, (n / trafficMax) * 36) }}
+                      />
+                      <span className={cn("text-[9px] font-mono", statusColor(code))}>{code}</span>
                     </div>
                   ))}
                 </div>
-              </div>
-            </>
-          )}
-        </Card>
 
-        {/* 系统状态 & 待审批 */}
-        <Card className="p-4">
-          <SectionTitle icon={ShieldCheckIcon}>系统状态</SectionTitle>
+                <div className="border-t pt-2.5">
+                  <div className="mb-1.5 text-[10px] text-muted-foreground">最近请求</div>
+                  <div className="flex flex-col gap-1.5">
+                    {recentTraffic.map((e) => (
+                      <div key={e.id} className="flex items-center gap-1.5 text-[10px]">
+                        <span
+                          className={cn(
+                            "shrink-0 rounded border px-1 py-0 font-mono text-[9px]",
+                            e.method === "GET"
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                              : "border-blue-500/30 bg-blue-500/10 text-blue-400",
+                          )}
+                        >
+                          {e.method}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                          {e.host}
+                          {e.url.replace(/^https?:\/\/[^/]+/, "").substring(0, 30)}
+                        </span>
+                        <span className={cn("shrink-0 font-mono text-[9px]", statusColor(e.status))}>{e.status}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+          </Card>
+        )}
 
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
-              <div className="text-[10px] text-muted-foreground">LLM 配置</div>
-              <Badge
-                variant="outline"
-                className={cn(
-                  "text-[10px]",
-                  stats?.llm_configured
-                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                    : "border-red-500/30 bg-red-500/10 text-red-400",
-                )}
-              >
-                {stats?.llm_configured ? "已配置" : "未配置"}
-              </Badge>
-            </div>
+        {/* 系统状态 & 待审批 —— /api/settings、/api/intercept 是管理员接口 */}
+        {isAdmin && (
+          <Card className="p-4">
+            <SectionTitle icon={ShieldCheckIcon}>系统状态</SectionTitle>
 
-            <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
-              <div className="text-[10px] text-muted-foreground">审计工具集</div>
-              <Badge
-                variant="outline"
-                className="border-violet-500/30 bg-violet-500/10 text-[10px] text-violet-400"
-                title="代码审计平台已移除 Bash / WebFetch / WebSearch / 流量 / MCP 等出网与执行类工具"
-              >
-                仅本地读写
-              </Badge>
-            </div>
-
-            {activeProfile && (
+            <div className="flex flex-col gap-2">
               <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
-                <div className="text-[10px] text-muted-foreground">激活模型</div>
-                <span className="font-mono text-[10px]">{activeProfile.model}</span>
+                <div className="text-[10px] text-muted-foreground">LLM 配置</div>
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "text-[10px]",
+                    stats?.llm_configured
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                      : "border-red-500/30 bg-red-500/10 text-red-400",
+                  )}
+                >
+                  {stats?.llm_configured ? "已配置" : "未配置"}
+                </Badge>
+              </div>
+
+              <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
+                <div className="text-[10px] text-muted-foreground">审计工具集</div>
+                <Badge
+                  variant="outline"
+                  className="border-violet-500/30 bg-violet-500/10 text-[10px] text-violet-400"
+                  title="代码审计平台已移除 Bash / WebFetch / WebSearch / 流量 / MCP 等出网与执行类工具"
+                >
+                  仅本地读写
+                </Badge>
+              </div>
+
+              {activeProfile && (
+                <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2">
+                  <div className="text-[10px] text-muted-foreground">激活模型</div>
+                  <span className="font-mono text-[10px]">{activeProfile.model}</span>
+                </div>
+              )}
+            </div>
+
+            {/* pending approvals */}
+            {pendingCount > 0 && (
+              <div className="mt-3">
+                <div className="mb-1.5 text-[10px] font-medium text-amber-400">待审批 ({pendingCount})</div>
+                <div className="flex flex-col gap-1.5">
+                  {pending.slice(0, 3).map((p) => (
+                    <Link
+                      key={p.id}
+                      href="/system/intercept/approvals"
+                      className="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/5 px-2.5 py-2 hover:bg-amber-500/10"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-[10px] font-medium">{p.tool_name}</div>
+                        <div className="text-[9px] text-muted-foreground">{p.agent_name}</div>
+                      </div>
+                      <ArrowUpRightIcon className="size-3 shrink-0 text-amber-400" />
+                    </Link>
+                  ))}
+                  {pendingCount > 3 && (
+                    <Link
+                      href="/system/intercept/approvals"
+                      className="text-center text-[10px] text-muted-foreground hover:text-foreground"
+                    >
+                      还有 {pendingCount - 3} 条…
+                    </Link>
+                  )}
+                </div>
               </div>
             )}
-          </div>
 
-          {/* pending approvals */}
-          {pendingCount > 0 && (
-            <div className="mt-3">
-              <div className="mb-1.5 text-[10px] font-medium text-amber-400">待审批 ({pendingCount})</div>
-              <div className="flex flex-col gap-1.5">
-                {pending.slice(0, 3).map((p) => (
-                  <Link
-                    key={p.id}
-                    href="/system/intercept/approvals"
-                    className="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/5 px-2.5 py-2 hover:bg-amber-500/10"
-                  >
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-medium">{p.tool_name}</div>
-                      <div className="text-[9px] text-muted-foreground">{p.agent_name}</div>
-                    </div>
-                    <ArrowUpRightIcon className="size-3 shrink-0 text-amber-400" />
-                  </Link>
-                ))}
-                {pendingCount > 3 && (
-                  <Link
-                    href="/system/intercept/approvals"
-                    className="text-center text-[10px] text-muted-foreground hover:text-foreground"
-                  >
-                    还有 {pendingCount - 3} 条…
-                  </Link>
-                )}
+            {pendingCount === 0 && (
+              <div className="mt-3 rounded-lg border bg-muted/10 px-3 py-3 text-center text-[10px] text-muted-foreground">
+                <ShieldCheckIcon className="mx-auto mb-1 size-4 text-emerald-500/50" />
+                无待审批拦截
               </div>
-            </div>
-          )}
-
-          {pendingCount === 0 && (
-            <div className="mt-3 rounded-lg border bg-muted/10 px-3 py-3 text-center text-[10px] text-muted-foreground">
-              <ShieldCheckIcon className="mx-auto mb-1 size-4 text-emerald-500/50" />
-              无待审批拦截
-            </div>
-          )}
-        </Card>
+            )}
+          </Card>
+        )}
       </div>
     </div>
   );

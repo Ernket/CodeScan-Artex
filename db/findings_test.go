@@ -139,8 +139,8 @@ func TestFindingsPageAndStats(t *testing.T) {
 	}
 
 	// Stats: whole-table, so assert our contribution is reflected (>=) and the
-	// marker vulnclass is present.
-	st, err := d.FindingStats()
+	// marker vulnclass is present. Scope All=true = unscoped (admin view).
+	st, err := d.FindingStats(FindingScope{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
