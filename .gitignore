@@ -36,6 +36,7 @@ Thumbs.db
 
 # 内嵌前端的单二进制产物
 /artex
+/artex.exe
 # 一键更新在可执行文件旁留下的中间产物（暂存件 / 备份 / 失败版本 / 升级标记）
 /artex.new
 /artex.new.sha256
@@ -56,8 +57,6 @@ Thumbs.db
 
 # bench 基准测试相关（本地产物，不提交）
 /bench/
-/Dockerfile.bench
-/Dockerfile.bench.v2
 
 # WorkBuddy 本地记忆/会话数据（含本机信息，不提交）
 .workbuddy/

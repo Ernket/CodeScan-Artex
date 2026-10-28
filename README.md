@@ -40,7 +40,7 @@ Read · Write · Edit · MultiEdit · LS · Glob · Grep
 
 **② 装配层不再注入危险来源**
 
-`server/hostTools()` 不返回流量工具、自定义工具与 MCP；`server/assembly.go` 不再展开 MCP 服务器——所以**连 `mcp__*` 工具都不会出现在 Agent 的工具列表里**。系统设置里的「MCP」「自定义工具」入口只保留历史数据查看。
+`server/hostTools()` 不返回流量工具、自定义工具与 MCP；`server/assembly.go` 不再展开 MCP 服务器——所以**连 `mcp__*` 工具都不会出现在 Agent 的工具列表里**。
 
 **③ 兜底黑名单：配置也绕不过去**
 
@@ -62,21 +62,21 @@ var codeAuditDeniedTools = []string{
 
 **④ 写入侧还有拦截规则**
 
-被测源码是审计证据，任何改动都会让结论不可复现。拦截规则按优先级匹配工具输入，首条命中即生效：
+被测源码是审计证据，任何改动都会让结论不可复现。内置规则按优先级匹配**序列化的工具输入**，首条命中即生效；规则可在「系统设置 → 命令拦截」里关闭、修改或删除：
 
-| 优先级 | 规则 | 匹配 | 动作 |
-| --- | --- | --- | --- |
-| 30 | 被测源码只读 | `\.\./source/` | 拒绝 |
-| 20 | 工作区外写入需审批 | `\.\./` | 转人工 |
-| 10 | 平台不出网 | `https?://` | 拒绝 |
+| 优先级 | 规则 | 匹配 |
+| --- | --- | --- |
+| 100 | 系统破坏性命令 | `rm -rf`、删除系统关键目录、`mkfs`、`dd of=/dev/*`、fork 炸弹、`shutdown` / `reboot`、`kill -9 -1`、`shred` / `wipe`、清空防火墙 |
+| 90 | 数据库破坏性操作 | `DROP DATABASE/TABLE/...`、`TRUNCATE`、Mongo `drop`、Redis `FLUSHALL` / `FLUSHDB` |
+| 80 | HTTP DELETE 请求 | `curl -X DELETE`、Python `requests.delete(`、`method: 'DELETE'` |
+| 80 | 清空 / 删除类接口路径 | `/clear`、`/wipe`、`/delete...`、`/remove...` 等 |
+| 80 | 数据外泄管道（默认关闭） | 命令输出经 `curl` / `wget` / `nc` 外传 |
 
-拦截范围只覆盖写入类工具（`Write` / `Edit` / `MultiEdit`）——读工具的常规路径本来就是 `../source`、`../deps`。被拦下的调用会挂在任务详情的「拦截审批」里等人工裁决。
+默认进入拦截层的工具是 `Write` / `Edit` / `MultiEdit`（`Bash`、`WebFetch`、`shell_*` 在本平台装配层就不存在）。命中 `deny` 的调用直接拒绝并记入任务详情的「拦截审批」，只有 `ask` 类规则才会挂起等人工裁决。
 
 ---
 
 ## 截图预览
-
-> 以下截图取自 `NEXT_PUBLIC_MOCK=1` 的离线 Demo（无后端、内置 `acme-mall` 演示数据）。完整交互见[在线 Demo](https://artex-demo.vercel.app/)。
 
 | 仪表盘（总览 / Token 消耗 / 活动流） | 任务列表 |
 | :---: | :---: |
@@ -326,78 +326,30 @@ flowchart TB
 
 ## 安装
 
-> 依赖数据库 **PostgreSQL**；需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
+> 依赖 **PostgreSQL**、**Go >= 1.26**；内嵌前端还需要 **Node.js / npm**。需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
 
-### 方式一：一键安装脚本（推荐）
-
-```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
-./install.sh
-```
-
-脚本会：检测 / 自动安装 Docker → 让你选 **① 全部 Docker** 或 **② 本地编译运行**：
-
-- **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
-- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动。
-
-装好后打开 **http://localhost:7878**（首次进入 `/setup` 设置管理员密码）。
-
-### 方式二：Docker Compose（手动）
+### 从源码编译（唯一安装方式）
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
-cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
-# → http://localhost:7878
-```
-
-镜像已含常用工具（ripgrep / vim / npm…）；`./skills` 与 `./data` 以绑定挂载持久化。
-
-> 代码审计平台的 Agent **只保留本地文件读写 / 检索工具**（Read / Write / Edit / MultiEdit / LS / Glob / Grep），
-> 没有任何出网或执行外部命令的能力：流量抓取 / 回放、自定义命令与脚本、MCP 工具在装配层就不注入，
-> 详见上面的 [安全边界](#安全边界红线)。
-
-### 方式三：下载预编译二进制（Releases）
-
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
-
-```bash
+git clone https://github.com/Ernket/CodeScan-Artex.git
+cd CodeScan-Artex
 cp config.example.json config.json   # 填好 database 连接
-./start.sh                           # → http://localhost:7878
-```
-
-> 请用 `start.sh` / `start.bat` 启动，而不是直接跑 `./artex`。它是个守护脚本：程序退出后按退出码决定是否重新拉起，**页面上的[一键更新](#方式一页面一键更新推荐)靠它完成换装**。直接运行 `./artex` 时更新完就不会被拉起了。
-> 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
-
-### 方式四：从源码编译单二进制
-
-```bash
 # 1) 前端静态导出
 cd web && npm ci && npm run build:static && cd ..
 # 2) 拷进内嵌目录
 cp -r web/out server/webui/dist
 # 3) 编译（-tags embedui 才内嵌前端）
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
-./start.sh
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+# 4) 启动
+./start.sh                           # → http://localhost:7878
 ```
 
-### 方式五：构建跨平台 Release 压缩包
+也可以直接运行 `./install.sh`：交互式填写数据库连接 → 生成 `config.json` → 编译并启动。
 
-`build.sh` 会先构建并嵌入前端，再使用 Go linker 去除调试信息，并将发布文件压缩为 zip。Release 模式默认生成 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 的 zip 包：
+> 请用 `start.sh` / `start.bat` 启动，而不是直接跑 `./artex`。它是个守护脚本：程序异常退出时按退出码决定是否重新拉起。
+> 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
 
-```bash
-./build.sh --release
-# 产物：dist/artex-0.3.3-*.zip
-```
-
-UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `ARTEX_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
-
-```bash
-ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
-./build.sh --target linux/amd64 --upx
-```
+首次访问 `/setup` 设置管理员密码。
 
 ### 账号、部门与权限
 
@@ -411,69 +363,25 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 ```bash
 ./reset-password.sh                          # 默认重置 admin，交互输入新密码
 ./reset-password.sh -u someone -p 'NewPass!' # 重置指定账号
-./reset-password.sh -m docker                # docker 部署（在 postgres 容器内执行）
 ```
 
 ---
 
 ## 更新升级
 
-> 升级只换程序、不动数据：Postgres 数据卷 `pgdata`、`./data`（jwt.key / SQLite 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
+> 升级只换程序、不动数据：Postgres 数据库、`./data`（`jwt.key` 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
 
-### 方式一：页面一键更新（推荐）
-
-在 **系统配置** 页（侧边栏「系统配置」→ `/system/settings`）的**版本与更新**卡片里，可以直接检查并安装新版本，无需登录服务器。
-
-点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存为 `artex.new` → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
-
-- **失败不会留下坏程序**：校验或冒烟不通过就丢弃暂存件、继续跑当前版本；换装后的新版若连续 3 次启动失败，会自动回滚到 `artex.old`（失败的那个留作 `artex.failed` 供排查）。
-- **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
-- **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
-- **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
-- **Docker 下只换程序、不换镜像**：镜像里的反编译工具链（JDK / cfr）不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级仍请用 `docker compose pull artex && docker compose up -d artex`。
-- 访问 GitHub 需要代理时，在同一页面配置**全局代理**即可，更新链路会走它。更新只从 GitHub 域名下载并强制 HTTPS。
-
-### 方式二：一键更新脚本
-
-```bash
-cd ARTEX
-./update.sh
-```
-
-脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
-
-- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
-- **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
-
-### 方式三：Docker Compose（手动）
-
-```bash
-cd ARTEX
-git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
-docker compose pull artex
-docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
-docker image prune -f          # 清理旧镜像（可选）
-```
-
-### 方式四：预编译二进制（Releases）
-
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
-
-```bash
-cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
-./start.sh
-```
-
-### 方式五：从源码编译
+### 从源码编译更新
 
 ```bash
 git pull
 cd web && npm ci && npm run build:static && cd ..
 cp -r web/out server/webui/dist
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
 # 重启 ./start.sh
 ```
+
+也可以直接运行 `./update.sh`：可选 `git pull` → 重建前端 → 重新编译，完成后重启进程生效。
 
 ---
 
@@ -505,8 +413,6 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 | `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` | 覆盖 LLM 供应商 / 模型 / 端点 |
 
 **常用启动参数**：`./start.sh -addr :7878`（`-addr` 前端 + API，默认 `:7878`）。启动脚本会把参数原样透传给 `artex`。
-
-> `-proxy` 是早期版本用于流量录制的代理端口，代码审计平台默认空（关闭），一般不需要设置。
 
 ### Java 依赖读取与反编译（可选）
 
@@ -579,7 +485,7 @@ server {
 - 后端：`go run ./cmd/artex`（不带 `-tags embedui` 则不内嵌前端）
 - 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
 - 测试：`go test ./...`
-- **Mock 预览（无后端）**：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev` —— 整站用内置演示数据跑通，README 里的截图就是这么出的。
+- **Mock 预览（无后端）**：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev` —— 整站用内置示例数据跑通，不需要后端与数据库。
 
 ### Agent 与提示词
 
@@ -592,13 +498,9 @@ Agent 分两类，都在「Agent 管理」页配置（提示词版本、绑定 L
 
 ### 演示数据（Mock 模式）
 
-`NEXT_PUBLIC_MOCK=1` 会短路 `web/src/lib/mock/` 里的路由与数据，**不需要后端与数据库**，适合：
+`NEXT_PUBLIC_MOCK=1` 会短路 `web/src/lib/mock/` 里的路由与数据，**不需要后端与数据库**，适合前端联调、空态 / 错误态 / 长列表验证，以及纯静态预览。
 
-- 给 README / 文档出截图；
-- 前端改动时验证各种空态、错误态与长列表；
-- 部署一个纯静态的在线 Demo（Vercel 等）。
-
-演示数据是一套完整的 `acme-mall`（Java / Spring Boot 多模块）审计剧本：3 个应用 + 17 个接口、14 条缺陷、8 个第三方依赖、12 条探索意图、3 段人机对话，外加一条已完成的漏洞复核记录。所有时间戳会在加载时**整体平移到「当前时间」**，所以 Demo 永远看起来是刚发生的、仪表盘的 7 天 / 30 天窗口也不会空。
+> 注意：`web/src/lib/mock/data.ts` 目前仍是早期版本留下的示例数据，只用于验证 UI 渲染，不代表真实审计产出。
 
 ---
 

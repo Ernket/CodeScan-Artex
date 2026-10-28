@@ -1,5 +1,5 @@
 #!/bin/sh
-# ARTEX 守护启动脚本（Linux / macOS / Docker ENTRYPOINT）
+# ARTEX 守护启动脚本（Linux / macOS）
 #
 # 用法：
 #   ./start.sh                       前台运行（Ctrl-C 停止）
@@ -31,9 +31,7 @@ stopping=0
 
 # 转发停止信号给 artex 本体。
 #
-# Docker 下这是必需的：docker stop 只把 SIGTERM 发给 PID 1（也就是本脚本），
-# 不会发给子进程。不转发的话 artex 收不到信号、做不了优雅关闭，10 秒后被 SIGKILL
-# 硬杀，正在跑的任务直接断在半路。
+# 不转发的话 artex 收不到 SIGTERM、做不了优雅关闭，正在跑的任务会直接断在半路。
 forward() {
 	stopping=1
 	if [ "$child" -ne 0 ]; then
