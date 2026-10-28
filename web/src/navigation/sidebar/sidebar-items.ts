@@ -1,21 +1,28 @@
 import {
+  Activity,
   BellRing,
   Bot,
   Brain,
   Bug,
   Building2,
+  ClipboardCheck,
   FolderOpen,
   FolderSync,
   LayoutDashboard,
   type LucideIcon,
   MessageSquare,
   Network,
+  Plug,
   Radio,
   ScrollText,
   Settings2,
+  ShieldAlert,
+  ShieldBan,
   Sparkles,
   Target,
+  Terminal,
   Users,
+  Wrench,
 } from "lucide-react";
 
 export type NavBadge = "new" | "soon";
@@ -63,8 +70,9 @@ export interface NavGroup {
   items: NavMainItem[];
 }
 
-// SCA Audit 是代码审计平台：对外发请求/抓包/执行命令相关的入口（流量、工具执行、MCP、
-// 自定义工具、拦截规则/审批）已从导航移除——对应的 agent 能力也已从工具层删除。
+// SCA Audit 是代码审计平台：对外发请求/抓包/执行命令相关的 agent 工具已从工具层删除，
+// 但对应的管理页仍保留（流量、工具调用记录、工具目录、MCP、拦截规则/审批/资产拦截），
+// 仅管理员可见，用于查看历史记录与维护配置。
 export const sidebarItems: NavGroup[] = [
   {
     id: 1,
@@ -78,6 +86,8 @@ export const sidebarItems: NavGroup[] = [
       { id: "assets", title: "测试资产", url: "/function/assets", icon: Network },
       { id: "sync", title: "资产同步", url: "/function/sync", icon: FolderSync, adminOnly: true },
       { id: "workspace", title: "工作空间", url: "/function/workspace", icon: FolderOpen, adminOnly: true },
+      { id: "traffic", title: "流量", url: "/function/traffic", icon: Activity, adminOnly: true },
+      { id: "commands", title: "工具调用记录", url: "/function/commands", icon: Terminal, adminOnly: true },
     ],
   },
   {
@@ -89,6 +99,23 @@ export const sidebarItems: NavGroup[] = [
       { id: "llm", title: "LLM", url: "/system/llm", icon: Brain, adminOnly: true },
       { id: "agents", title: "Agent", url: "/system/agents", icon: Bot, adminOnly: true },
       { id: "skills", title: "Skill", url: "/system/skills", icon: Sparkles, adminOnly: true },
+      { id: "tools", title: "工具", url: "/system/tools", icon: Wrench, adminOnly: true },
+      { id: "mcp", title: "MCP", url: "/system/mcp", icon: Plug, adminOnly: true },
+      { id: "intercept", title: "命令拦截", url: "/system/intercept", icon: ShieldAlert, adminOnly: true },
+      {
+        id: "approvals",
+        title: "拦截审批",
+        url: "/system/intercept/approvals",
+        icon: ClipboardCheck,
+        adminOnly: true,
+      },
+      {
+        id: "asset-intercept",
+        title: "资产拦截",
+        url: "/system/intercept/assets",
+        icon: ShieldBan,
+        adminOnly: true,
+      },
       { id: "notify", title: "通知推送", url: "/system/notify", icon: BellRing, adminOnly: true },
       { id: "logs", title: "日志", url: "/system/logs", icon: ScrollText, adminOnly: true },
       { id: "settings", title: "系统配置", url: "/system/settings", icon: Settings2, adminOnly: true },
