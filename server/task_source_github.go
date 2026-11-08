@@ -238,7 +238,9 @@ func (s *Server) getTaskUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := currentUser(r)
-	if me != nil && !me.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != me.ID {
+	// created_by 为 NULL（属主账号已被删除，外键 ON DELETE SET NULL）的行只对
+	// 管理员开放；否则任何人都能查看/接管一笔无主上传。
+	if me != nil && !me.IsAdmin && (up.CreatedBy == nil || *up.CreatedBy != me.ID) {
 		writeErr(w, 403, "无权查看他人的上传")
 		return
 	}
@@ -258,7 +260,7 @@ func (s *Server) confirmTaskUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := currentUser(r)
-	if me != nil && !me.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != me.ID {
+	if me != nil && !me.IsAdmin && (up.CreatedBy == nil || *up.CreatedBy != me.ID) {
 		writeErr(w, 403, "无权操作他人的上传")
 		return
 	}

@@ -191,7 +191,9 @@ func (s *Server) listTaskUploads(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(rows))
 	for _, up := range rows {
-		if me != nil && !me.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != me.ID {
+		// created_by 为 NULL（属主账号已删）的行只对管理员可见，避免无主上传
+		// 被他人查看或消费。
+		if me != nil && !me.IsAdmin && (up.CreatedBy == nil || *up.CreatedBy != me.ID) {
 			continue
 		}
 		// created_by 必须返回：抽屉恢复时要按归属过滤，否则管理员会把别人正在
@@ -223,7 +225,7 @@ func (s *Server) deleteTaskUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "上传不存在或已被使用")
 		return
 	}
-	if me != nil && !me.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != me.ID {
+	if me != nil && !me.IsAdmin && (up.CreatedBy == nil || *up.CreatedBy != me.ID) {
 		writeErr(w, 403, "无权删除他人的上传")
 		return
 	}
@@ -274,7 +276,8 @@ func (s *Server) attachUploadToTask(caller *db.User, t *Task, uploadID string) e
 	if err != nil {
 		return fmt.Errorf("上传不存在或已过期，请重新上传")
 	}
-	if caller != nil && !caller.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != caller.ID {
+	// created_by 为 NULL（属主账号已删）同样拒绝：无主上传只能由管理员消费。
+	if caller != nil && !caller.IsAdmin && (up.CreatedBy == nil || *up.CreatedBy != caller.ID) {
 		return fmt.Errorf("无权使用他人的上传，请自己重新导入")
 	}
 	// 唯一的「源码是否就绪」闸门。前端不可信：用 fetching 中的 id 建任务，

@@ -316,18 +316,21 @@ func (s *TaskUploadStore) AllTaskUploadIDs() (map[string]bool, error) {
 //
 // keepReadyFor is the TTL for unused ready rows (a user may come back to finish
 // creating the task). keepFailedFor covers failed rows (only need to survive long
-// enough to be read) and awaiting_confirm rows (the background goroutine gives up
-// after 10 minutes on its own; this is the safety net for a row whose goroutine
-// died with the process, so the partial unique index is released).
+// enough to be read).
+//
+// awaiting_confirm 刻意不在这里回收：确认等待时长是可配置的
+// (ConfirmTimeoutSeconds)，用固定 TTL 按 created_at 删行会和活着的确认窗口
+// 打架——goroutine 还在等用户，行和 download.zip 却没了。该状态由两条路径
+// 兜底：goroutine 自己的确认超时（超时置 failed 后走上面的 TTL），以及进程
+// 重启时的 RecoverInterruptedTaskUploads（同样置 failed）。
 func (s *TaskUploadStore) ExpiredTaskUploads(keepReadyFor, keepFailedFor time.Duration) ([]string, error) {
 	rows, err := s.db.Query(`
 SELECT id FROM task_uploads
 WHERE consumed_by IS NULL
   AND ((state=$1 AND created_at < now() - $2::interval)
-    OR (state IN ($3,$5) AND created_at < now() - $4::interval))`,
+    OR (state=$3 AND created_at < now() - $4::interval))`,
 		UploadStateReady, intervalArg(keepReadyFor),
-		UploadStateFailed, intervalArg(keepFailedFor),
-		UploadStateAwaitingConfirm)
+		UploadStateFailed, intervalArg(keepFailedFor))
 	if err != nil {
 		return nil, err
 	}

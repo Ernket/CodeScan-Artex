@@ -3575,7 +3575,7 @@ function CreateTaskSheet({
       .taskUploads()
       .then((rows) => {
         const mine = rows
-          .filter((u) => (u.created_by ?? meId) === meId && u.state !== "failed")
+          .filter((u) => u.created_by === meId && u.state !== "failed")
           .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
         const pick = mine[0];
         if (!pick) return;

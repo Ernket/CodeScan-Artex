@@ -15,7 +15,9 @@ const (
 	uploadJanitorInterval = 30 * time.Minute
 	// 未消费的 ready：给用户一天时间回来建任务（前端会把最近一条恢复到抽屉里）。
 	uploadKeepReadyFor = 24 * time.Hour
-	// failed / awaiting_confirm：只要能撑到用户刷新页面看到原因就够了。
+	// failed：只要能撑到用户刷新页面看到原因就够了。awaiting_confirm 不由
+	// janitor 回收（见 ExpiredTaskUploads 的注释），它归 goroutine 的确认超时
+	// 和启动恢复管。
 	uploadKeepFailedFor = time.Hour
 	// 无主目录的宽限期。必须明显大于一次导入的时长：目录在数据库行之前创建，
 	// 两者之间存在窗口，宽限期太短会把正在下载的目录删掉。
