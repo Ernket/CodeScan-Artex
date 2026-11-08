@@ -183,6 +183,10 @@ package_binary() {
   fi
   cp -R skills "$package_root/"
   cp config.example.json "$package_root/"
+  # 内置 CFR 的 MIT 许可证：jar 已编进二进制，许可证必须随包分发。
+  if [ -f javadeps/tools/CFR-LICENSE.txt ]; then
+    cp javadeps/tools/CFR-LICENSE.txt "$package_root/CFR-LICENSE.txt"
+  fi
   if [ -f README.md ]; then cp README.md "$package_root/"; fi
   (cd "$ARTEX_PACKAGE_DIR" && zip -q -r -9 "$(basename "$archive")" "$(basename "$package_root")")
   rm -rf "$package_root"

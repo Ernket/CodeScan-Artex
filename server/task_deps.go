@@ -45,9 +45,10 @@ var (
 
 // depsService builds (and caches) the dependency service for this data dir.
 //
-// Tool resolution order: explicit config/env → jars under <data>/tools →
-// `java` on PATH. When no decompiler is found the service still works for ingest;
-// only on-demand decompilation reports "unavailable".
+// Tool resolution order: explicit config/env → jars under <data>/tools → the CFR
+// jar compiled into the binary (materialized once under <data>/cache/decompiler)
+// → `java` on PATH. When no decompiler is found the service still works for
+// ingest; only on-demand decompilation reports "unavailable".
 //
 // The local Maven repository (java.local_repo / ARTEX_JAVA_LOCAL_REPO) is optional
 // and independent of the decompiler: with it configured, a task can pull a jar by
@@ -73,6 +74,15 @@ func (s *Server) depsService() *javadeps.Service {
 		}
 		if cfr == "" {
 			cfr = dc
+		}
+	}
+	if cfr == "" && javaPath != "" && javadeps.EmbeddedCFRAvailable() {
+		// Bundled CFR: extracted once into the data root, then reused as-is.
+		if p, err := javadeps.MaterializeEmbeddedCFR(filepath.Join(dataDir, "cache", "decompiler")); err == nil {
+			cfr = p
+			log.Printf("[javadeps] 使用内置 CFR %s: %s", javadeps.EmbeddedCFRVersion, p)
+		} else {
+			log.Printf("[javadeps] 内置 CFR 释放失败（将只做索引）: %v", err)
 		}
 	}
 	timeout := javadeps.DefaultTimeout

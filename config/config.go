@@ -25,8 +25,9 @@ type Database struct {
 }
 
 // JavaDecompiler configures reading and decompiling Java dependencies (see
-// docs/java-m2依赖读取与反编译方案.md). Every field is optional: with none set, the
-// platform auto-detects `java` on PATH and looks for a decompiler jar under
+// docs/java-m2依赖读取与反编译方案.md). Every field is optional: the platform
+// auto-detects `java` on PATH, falls back to a CFR jar compiled into the binary
+// (extracted under <data>/cache/decompiler), and prefers any jar under
 // <data>/tools. When nothing usable is found, dependency *reading* still works
 // (manifest + class index); only on-demand decompilation is unavailable.
 type JavaDecompiler struct {
@@ -185,7 +186,8 @@ func GitHubSettings() GitHubImport {
 //	     ARTEX_DECOMPILE_TIMEOUT / ARTEX_DECOMPILE_MAX_HEAP /
 //	     ARTEX_JAVA_LOCAL_REPO)
 //	  >  config file (java.*)
-//	  >  auto-detection by the caller (java on PATH, jars under <data>/tools)
+//	  >  auto-detection by the caller (java on PATH, jars under <data>/tools,
+//	     the CFR jar compiled into the binary)
 //
 // It never fails: an empty result simply means "let the caller auto-detect".
 func JavaSettings() JavaDecompiler {

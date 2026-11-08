@@ -201,6 +201,8 @@ flowchart LR
 
 > 实测一个 1.7 MB 的 jar 反编译要 40~60 秒，所以平台不提供「全部反编译」。**反编译产物不是原始源码**（行号、结构、变量名都可能不同），引用时必须注明。
 
+**反编译器随平台分发**：CFR 0.152（MIT）已经 `go:embed` 编进 `artex` 二进制，首次使用时释放到 `data/cache/decompiler/`，因此不需要自己下载反编译 jar——机器上只要装了 **JRE 8+**，第 3 步的按需反编译即可用。想换更新版 CFR 或 Vineflower，把 jar 丢进 `data/tools/` 即可覆盖内置版本（见「Java 依赖读取与反编译」）。连 Java 都没有时也不影响清单与类名索引，只是这一步会报不可用。
+
 **可达性三步**（缺一步都不算缺陷）：
 
 | 步骤 | 怎么做 | 判不通过的典型情形 |
@@ -328,7 +330,7 @@ flowchart TB
 
 ## 安装
 
-> 依赖 **PostgreSQL**、**Go >= 1.26**；内嵌前端还需要 **Node.js / npm**。需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
+> 依赖 **PostgreSQL**、**Go >= 1.26**；内嵌前端还需要 **Node.js / npm**。需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。反编译依赖源码需要本机 **Java（JRE 8+）**；反编译器 CFR 已编进二进制，无需额外下载。
 
 ### 从源码编译（唯一安装方式）
 
@@ -418,15 +420,17 @@ CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
 
 ### Java 依赖读取与反编译（可选）
 
-平台读第三方 jar 需要 `java` + 一个反编译 jar。**不配也能用**——依赖清单 `INDEX.md` 与类名索引 `index/classes.txt` 始终可用，`list_dependencies` 正常返回坐标、版本与源码状态，只是「按需反编译」会报不可用。
+平台读第三方 jar 需要 `java`。**反编译器已内置**：CFR 0.152（MIT）编译进了二进制，首次使用时释放到 `data/cache/decompiler/`，因此只要机器上有 JRE（8+）就能按需反编译，不用再下载任何 jar。
 
-探测顺序：**显式配置 / 环境变量 → `<data>/tools/` 下的 jar → PATH 里的 `java`**。
+**不配 java 也能用**——依赖清单 `INDEX.md` 与类名索引 `index/classes.txt` 始终可用，`list_dependencies` 正常返回坐标、版本与源码状态，只是「按需反编译」会报不可用。
+
+探测顺序：**显式配置 / 环境变量 → `<data>/tools/` 下的 jar → 内置 CFR → PATH 里的 `java`**。放在 `<data>/tools/` 里的 jar（例如更新版 CFR 或 Vineflower）优先于内置版本。
 
 | `config.json`（`java.*`） | 环境变量 | 说明 |
 | --- | --- | --- |
 | `java_path` | `ARTEX_JAVA_PATH` | `java` 可执行文件；留空则搜 PATH |
 | `vineflower_jar` | `ARTEX_VINEFLOWER_JAR` | Vineflower（需 JRE 17+，多线程、对新版 Java 支持更好，**优先**） |
-| `cfr_jar` | `ARTEX_CFR_JAR` | CFR（JRE 6+ 即可运行，**兜底**） |
+| `cfr_jar` | `ARTEX_CFR_JAR` | CFR（JRE 6+ 即可运行）；不填则用内置 0.152，`<data>/tools/cfr-*.jar` 优先 |
 | `timeout_seconds` | `ARTEX_DECOMPILE_TIMEOUT` | 单个 jar 的反编译上限，默认 180 秒 |
 | `max_heap` | `ARTEX_DECOMPILE_MAX_HEAP` | 反编译 JVM 堆上限，默认 `2g` |
 | `local_repo` | `ARTEX_JAVA_LOCAL_REPO` | 本地 Maven 仓库（通常 `~/.m2/repository`），**只读** |
@@ -444,6 +448,8 @@ CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
 ```
 
 配好 `local_repo` 后，任务可以按 `group:artifact:version` 直接从本地仓库取 jar（**硬链接**进任务自己的 `deps/jars`，从不写入仓库），不必每次手工上传——这才是「配一次、每个任务都受益」。仓库路径写错会降级为「只能上传」，不会让依赖处理整体坏掉。
+
+内置 CFR 的版本、来源与 SHA-1 记录在 [javadeps/tools/CFR-LICENSE.txt](javadeps/tools/CFR-LICENSE.txt)，其 MIT 许可证随 release 压缩包以 `CFR-LICENSE.txt` 分发。
 
 ### 反向代理部署（HTTPS / 只开放 443）
 

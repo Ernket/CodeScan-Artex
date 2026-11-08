@@ -3,6 +3,7 @@ package javadeps
 import (
 	"archive/zip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -421,6 +422,81 @@ func TestWriteIndexCarriesRedLines(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("INDEX.md 缺少内容: %q", want)
 		}
+	}
+}
+
+// TestEmbeddedCFRMaterialize verifies the CFR jar compiled into the binary is a
+// real, runnable jar and that extracting it is idempotent (no pointless rewrites).
+func TestEmbeddedCFRMaterialize(t *testing.T) {
+	if !EmbeddedCFRAvailable() {
+		t.Skip("构建未内嵌 CFR")
+	}
+	dir := t.TempDir()
+	p, err := MaterializeEmbeddedCFR(dir)
+	if err != nil {
+		t.Fatalf("MaterializeEmbeddedCFR 失败: %v", err)
+	}
+	if p != filepath.Join(dir, EmbeddedCFRName) {
+		t.Errorf("路径 = %q, 期望 %q", p, filepath.Join(dir, EmbeddedCFRName))
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != int64(len(embeddedCFR)) {
+		t.Errorf("大小 = %d, 期望 %d", fi.Size(), len(embeddedCFR))
+	}
+
+	// It must really be CFR, not an empty placeholder.
+	zr, err := zip.OpenReader(p)
+	if err != nil {
+		t.Fatalf("内置 jar 不是合法 zip: %v", err)
+	}
+	var manifest string
+	for _, e := range zr.File {
+		if e.Name == "META-INF/MANIFEST.MF" {
+			rc, err := e.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(rc)
+			rc.Close()
+			manifest = string(b)
+		}
+	}
+	// Close before the rewrite checks: Windows keeps the jar locked otherwise.
+	if err := zr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(manifest, "org.benf.cfr.reader.Main") {
+		t.Errorf("内置 jar 的 Main-Class 不是 CFR: %q", manifest)
+	}
+
+	// Second call must reuse the file rather than rewrite it.
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MaterializeEmbeddedCFR(dir); err != nil {
+		t.Fatalf("第二次 MaterializeEmbeddedCFR 失败: %v", err)
+	}
+	again, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.ModTime().Equal(old) {
+		t.Error("内容一致的内置 jar 被重复写入")
+	}
+
+	// A damaged copy must be replaced by the embedded bytes.
+	if err := os.WriteFile(p, []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MaterializeEmbeddedCFR(dir); err != nil {
+		t.Fatalf("修复损坏的内置 jar 失败: %v", err)
+	}
+	if ok, err := embeddedCFRMatches(p); !ok || err != nil {
+		t.Errorf("损坏的内置 jar 未被修复（ok=%v err=%v）", ok, err)
 	}
 }
 
