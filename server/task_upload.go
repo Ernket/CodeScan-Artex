@@ -360,13 +360,16 @@ var (
 )
 
 // extractOptions 让同一次解压逻辑服务两种来源：本地上传（无包裹目录、固定限额）
-// 与 GitHub 导入（需要剥 {repo}- 前缀、限额可配、可取消）。
+// 与仓库导入（需要剥 {repo}- 前缀、限额可配、可取消）。
 type extractOptions struct {
 	// WrapperPrefix 非空时，若归档只有一个顶层目录且名字以它开头，则剥掉这层。
 	WrapperPrefix string
-	MaxBytes      int64
-	MaxFiles      int
-	Context       context.Context
+	// MaxBytes / MaxFiles 为 0 时用上传路径的默认值；为负数时**不限制**
+	// （GitLab 导入用，体积无法预估）。用负数而不是 0 表示不限，是为了不让
+	// 现有「传 0 走默认」的调用方意外变成无上限。
+	MaxBytes int64
+	MaxFiles int
+	Context  context.Context
 }
 
 // extractZipArchive unpacks src into dest with the upload path's defaults.
@@ -383,11 +386,12 @@ func extractZipArchive(src, dest string) (zipStats, error) {
 func extractZipArchiveOpts(src, dest string, opt extractOptions) (zipStats, error) {
 	var stats zipStats
 	maxBytes := opt.MaxBytes
-	if maxBytes <= 0 {
+	if maxBytes == 0 {
 		maxBytes = maxExtractBytes
 	}
+	unlimitedBytes := maxBytes < 0
 	maxFiles := opt.MaxFiles
-	if maxFiles <= 0 {
+	if maxFiles == 0 {
 		maxFiles = maxExtractFiles
 	}
 	ctx := opt.Context
@@ -400,7 +404,7 @@ func extractZipArchiveOpts(src, dest string, opt extractOptions) (zipStats, erro
 		return stats, fmt.Errorf("%w：文件不是合法的 zip（%v）", errNotZip, err)
 	}
 	defer zr.Close()
-	if len(zr.File) > maxFiles {
+	if maxFiles > 0 && len(zr.File) > maxFiles {
 		return stats, fmt.Errorf("%w（%d 个）", errTooManyFiles, maxFiles)
 	}
 
@@ -439,7 +443,7 @@ func extractZipArchiveOpts(src, dest string, opt extractOptions) (zipStats, erro
 			cleanupRaw()
 			return stats, err
 		}
-		if stats.Bytes+int64(f.UncompressedSize64) > maxBytes {
+		if !unlimitedBytes && stats.Bytes+int64(f.UncompressedSize64) > maxBytes {
 			cleanupRaw()
 			return stats, fmt.Errorf("%w（%d MiB）", errTooLargeExtract, maxBytes>>20)
 		}
@@ -467,7 +471,7 @@ func extractZipArchiveOpts(src, dest string, opt extractOptions) (zipStats, erro
 		}
 		stats.Files++
 		stats.Bytes += n
-		if stats.Files > int64(maxFiles) {
+		if maxFiles > 0 && stats.Files > int64(maxFiles) {
 			cleanupRaw()
 			return stats, fmt.Errorf("%w（%d 个）", errTooManyFiles, maxFiles)
 		}

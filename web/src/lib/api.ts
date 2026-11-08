@@ -353,7 +353,7 @@ export const api = {
   taskUploads: () => get<{ uploads: TaskUpload[] }>("/tasks/uploads").then((r) => arr(r.uploads)),
   deleteTaskUpload: (uploadId: string) => del<{ deleted: string }>(`/tasks/uploads/${encodeURIComponent(uploadId)}`),
 
-  // ---- GitHub 仓库导入（见 docs/github-source-import.md）----
+  // ---- 仓库导入：GitHub / GitLab（见 docs/github-source-import.md）----
   // importFromGithub 第一次调用可能返回 needs_confirm（仓库体积超过软上限）：
   // 此时后端没有建行也没有下载，带 confirmLarge=true 重发即可。
   importFromGithub: (repoUrl: string, ref?: string, confirmLarge?: boolean, signal?: AbortSignal) =>

@@ -26,23 +26,31 @@ var allowedHosts = map[string]bool{
 	"api.github.com":                true,
 	"codeload.github.com":           true,
 	"objects.githubusercontent.com": true,
+	"gitlab.com":                    true,
+	"www.gitlab.com":                true,
 }
 
 const (
 	defaultAPIBase      = "https://api.github.com"
 	defaultCodeloadBase = "https://codeload.github.com"
+	// GitLab 的元数据、commit 与归档都在 /api/v4 下：
+	// /api/v4/projects/{urlencoded path}/repository/archive.zip。
+	defaultGitLabAPIBase = "https://gitlab.com/api/v4"
 	// 仓库元数据的缓存时长。一次导入最多查两次（首次估算 + 确认后重发），
-	// 缓存让第二次不再消耗 60/h 的配额。
+	// 缓存让第二次不再消耗配额。
 	repoCacheTTL = 5 * time.Minute
 	// 单次 API 响应体上限：元数据只有几百字节，超过这个数一定不是正常响应。
 	apiBodyLimit = 1 << 20
 )
 
-// Client talks to the GitHub API and codeload. It is safe for concurrent use.
+// Client talks to the code host's REST API and archive endpoint. It is safe for
+// concurrent use.
 type Client struct {
 	HC           *http.Client
 	APIBase      string
 	CodeloadBase string
+	// GitLab 的 API base（含 /api/v4，归档也在这个前缀下）。
+	GitLabAPIBase string
 
 	// allowInsecure 允许 http 的 APIBase（仅测试用，生产恒为 false）。
 	allowInsecure bool
@@ -70,15 +78,16 @@ type repoCacheEntry struct {
 func NewClient(proxy string) *Client {
 	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_ALLOW_LOOPBACK")); v == "1" || strings.EqualFold(v, "true") {
 		// 只给集成测试用，生产环境不应设置。
-		return newClient(proxy, defaultAPIBase, defaultCodeloadBase, true, true)
+		return newClient(proxy, defaultAPIBase, defaultCodeloadBase, defaultGitLabAPIBase, true, true)
 	}
-	return newClient(proxy, defaultAPIBase, defaultCodeloadBase, false, false)
+	return newClient(proxy, defaultAPIBase, defaultCodeloadBase, defaultGitLabAPIBase, false, false)
 }
 
-func newClient(proxy, apiBase, codeloadBase string, allowInsecure, allowLoopback bool) *Client {
+func newClient(proxy, apiBase, codeloadBase, gitlabAPIBase string, allowInsecure, allowLoopback bool) *Client {
 	c := &Client{
 		APIBase:       strings.TrimRight(apiBase, "/"),
 		CodeloadBase:  strings.TrimRight(codeloadBase, "/"),
+		GitLabAPIBase: strings.TrimRight(gitlabAPIBase, "/"),
 		allowInsecure: allowInsecure,
 		allowLoopback: allowLoopback,
 		cache:         map[string]repoCacheEntry{},
@@ -112,24 +121,32 @@ func newClient(proxy, apiBase, codeloadBase string, allowInsecure, allowLoopback
 	return c
 }
 
-// RepoInfo is the subset of GET /repos/{owner}/{repo} this package needs.
+// RepoInfo is the subset of the project metadata this package needs.
 type RepoInfo struct {
-	// Name is GitHub's canonical repo name (its casing may differ from the URL).
-	// The zip archive's wrapper directory is "{Name}-{ref}", so the exact string
-	// matters when stripping that wrapper.
+	// Name is the canonical project slug. The zip archive's wrapper directory is
+	// "{Name}-...", so the exact string matters when stripping that wrapper.
 	Name string `json:"name"`
 	// SizeKB is the repository size in kilobytes, including history. It is an
 	// estimate only: measured 39% larger than the generated zip on a real repo.
 	SizeKB int64 `json:"size"`
+	// SizeKnown reports whether SizeKB came from the API. GitHub always returns
+	// repository size; GitLab only returns `statistics` to callers with a token,
+	// so an anonymous GitLab import has no size estimate at all.
+	SizeKnown bool `json:"-"`
 }
 
-// Repo fetches repository metadata. Results are cached for repoCacheTTL.
+// Repo fetches project metadata. Results are cached for repoCacheTTL.
 func (c *Client) Repo(ctx context.Context, sp Spec) (*RepoInfo, error) {
-	key := strings.ToLower(sp.String())
+	key := strings.ToLower(string(sp.provider()) + ":" + sp.String())
 	if info := c.cacheGet(key); info != nil {
 		return info, nil
 	}
-	u := fmt.Sprintf("%s/repos/%s/%s", c.APIBase, url.PathEscape(sp.Owner), url.PathEscape(sp.Repo))
+	var u string
+	if sp.provider() == ProviderGitLab {
+		u = fmt.Sprintf("%s/projects/%s", c.GitLabAPIBase, url.PathEscape(sp.Path))
+	} else {
+		u = fmt.Sprintf("%s/repos/%s/%s", c.APIBase, url.PathEscape(sp.Owner()), url.PathEscape(sp.Repo()))
+	}
 	resp, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
@@ -138,12 +155,27 @@ func (c *Client) Repo(ctx context.Context, sp Spec) (*RepoInfo, error) {
 	if err := classify(resp); err != nil {
 		return nil, err
 	}
-	var info RepoInfo
-	if err := json.NewDecoder(io.LimitReader(resp.Body, apiBodyLimit)).Decode(&info); err != nil {
-		return nil, fmt.Errorf("解析仓库信息失败: %w", err)
+	info := RepoInfo{SizeKnown: true}
+	if sp.provider() == ProviderGitLab {
+		var body struct {
+			Path string `json:"path"`
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, apiBodyLimit)).Decode(&body); err != nil {
+			return nil, fmt.Errorf("解析仓库信息失败: %w", err)
+		}
+		// GitLab 的 archive.zip 顶层目录用 project path（slug），不是显示名；
+		// 显示名可能带空格，拿去匹配前缀永远对不上。
+		info.Name = body.Path
+		info.SizeKB = 0
+		info.SizeKnown = false
+	} else {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, apiBodyLimit)).Decode(&info); err != nil {
+			return nil, fmt.Errorf("解析仓库信息失败: %w", err)
+		}
 	}
 	if info.Name == "" {
-		info.Name = sp.Repo
+		info.Name = sp.Repo()
 	}
 	c.cachePut(key, info)
 	return &info, nil
@@ -164,8 +196,14 @@ func (c *Client) ResolveCommit(ctx context.Context, sp Spec) (string, error) {
 		}
 		ref = strings.Join(parts, "/")
 	}
-	u := fmt.Sprintf("%s/repos/%s/%s/commits/%s", c.APIBase,
-		url.PathEscape(sp.Owner), url.PathEscape(sp.Repo), ref)
+	u := ""
+	if sp.provider() == ProviderGitLab {
+		u = fmt.Sprintf("%s/projects/%s/repository/commits/%s", c.GitLabAPIBase,
+			url.PathEscape(sp.Path), ref)
+	} else {
+		u = fmt.Sprintf("%s/repos/%s/%s/commits/%s", c.APIBase,
+			url.PathEscape(sp.Owner()), url.PathEscape(sp.Repo()), ref)
+	}
 	resp, err := c.get(ctx, u)
 	if err != nil {
 		return "", err
@@ -183,26 +221,45 @@ func (c *Client) ResolveCommit(ctx context.Context, sp Spec) (string, error) {
 		if sp.Ref != "" && (errors.Is(err, ErrRepoNotFound) || isUnprocessable(resp.StatusCode)) {
 			return "", ErrRefNotFound
 		}
+		// GitLab 对空仓库的 /repository/commits/HEAD 返回 404 而不是 409。元数据
+		// 已经查成功说明仓库可见，此时未指定 ref 的 404 只能是「没有任何提交」。
+		if sp.provider() == ProviderGitLab && sp.Ref == "" && errors.Is(err, ErrRepoNotFound) {
+			return "", ErrEmptyRepo
+		}
 		return "", err
 	}
 	var body struct {
 		SHA string `json:"sha"`
+		// GitLab 用 id 表示 commit sha。
+		ID string `json:"id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, apiBodyLimit)).Decode(&body); err != nil {
 		return "", fmt.Errorf("解析 commit 失败: %w", err)
 	}
-	if !IsCommitSHA(body.SHA) {
-		return "", fmt.Errorf("GitHub 返回的 commit 不合法")
+	sha := body.SHA
+	if sha == "" {
+		sha = body.ID
 	}
-	return strings.ToLower(body.SHA), nil
+	if !IsCommitSHA(sha) {
+		return "", fmt.Errorf("代码托管平台返回的 commit 不合法")
+	}
+	return strings.ToLower(sha), nil
 }
 
-// OpenArchive streams the zipball for one commit. The caller MUST wrap the body
-// in an io.LimitReader: codeload sends chunked responses with no Content-Length
-// (measured), so the declared size is -1 and cannot be trusted for limits.
+// OpenArchive streams the source archive for one commit. The caller MUST wrap the
+// body in an io.LimitReader when a byte cap applies: both codeload and GitLab send
+// chunked responses with no Content-Length (measured), so the declared size is -1
+// and cannot be trusted.
 func (c *Client) OpenArchive(ctx context.Context, sp Spec, commit string) (io.ReadCloser, int64, error) {
-	u := fmt.Sprintf("%s/%s/%s/zip/%s", c.CodeloadBase,
-		url.PathEscape(sp.Owner), url.PathEscape(sp.Repo), url.PathEscape(commit))
+	var u string
+	if sp.provider() == ProviderGitLab {
+		// 归档接口也在 /api/v4 下；少这个前缀会落到 GitLab 网页路由并拿到 403。
+		u = fmt.Sprintf("%s/projects/%s/repository/archive.zip?sha=%s", c.GitLabAPIBase,
+			url.PathEscape(sp.Path), url.QueryEscape(commit))
+	} else {
+		u = fmt.Sprintf("%s/%s/%s/zip/%s", c.CodeloadBase,
+			url.PathEscape(sp.Owner()), url.PathEscape(sp.Repo()), url.PathEscape(commit))
+	}
 	resp, err := c.get(ctx, u)
 	if err != nil {
 		return nil, 0, err
@@ -227,16 +284,20 @@ func (c *Client) get(ctx context.Context, rawURL string) (*http.Response, error)
 		return nil, fmt.Errorf("构造请求失败")
 	}
 	req.Header.Set("User-Agent", "artex-github-import")
-	req.Header.Set("Accept", "application/vnd.github+json")
+	if strings.Contains(strings.ToLower(u.Hostname()), "gitlab") {
+		req.Header.Set("Accept", "application/json")
+	} else {
+		req.Header.Set("Accept", "application/vnd.github+json")
+	}
 	resp, err := c.HC.Do(req)
 	if err != nil {
 		// 不把原始错误抛给调用方：*url.Error 里带完整 URL（私库 token 场景下
 		// 会泄露凭据），这里只保留底层原因。
 		var uerr *url.Error
 		if errors.As(err, &uerr) && uerr.Err != nil {
-			return nil, fmt.Errorf("请求 GitHub 失败: %w", uerr.Err)
+			return nil, fmt.Errorf("请求代码托管平台失败: %w", uerr.Err)
 		}
-		return nil, fmt.Errorf("请求 GitHub 失败: %w", err)
+		return nil, fmt.Errorf("请求代码托管平台失败: %w", err)
 	}
 	return resp, nil
 }
@@ -342,12 +403,12 @@ func classify(resp *http.Response) error {
 		if strings.TrimSpace(resp.Header.Get("X-RateLimit-Remaining")) == "0" {
 			return ErrRateLimited
 		}
-		return fmt.Errorf("GitHub 拒绝访问（HTTP %d）", resp.StatusCode)
+		return fmt.Errorf("代码托管平台拒绝访问（HTTP %d）", resp.StatusCode)
 	default:
 		if resp.StatusCode >= 500 {
-			return fmt.Errorf("GitHub 服务异常（HTTP %d）", resp.StatusCode)
+			return fmt.Errorf("代码托管平台服务异常（HTTP %d）", resp.StatusCode)
 		}
-		return fmt.Errorf("GitHub 返回异常状态（HTTP %d）", resp.StatusCode)
+		return fmt.Errorf("代码托管平台返回异常状态（HTTP %d）", resp.StatusCode)
 	}
 }
 

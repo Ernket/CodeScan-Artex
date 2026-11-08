@@ -1767,8 +1767,10 @@ export interface TaskUpload {
   total_bytes: number;
   entries?: string[];
   created_at?: string;
-  // GitHub 导入（见 docs/github-source-import.md）。全部可选：本地上传与
+  // 仓库导入（见 docs/github-source-import.md）。全部可选：本地上传与
   // 旧响应都不带这些字段，前端按 undefined 处理。
+  // "github" = 从代码托管平台拉取，GitHub 与 GitLab 共用这一个值（落库判别值，
+  // 拆分会要数据迁移）；要区分平台看 source_url 的主机名。
   origin?: "upload" | "github";
   state?: TaskUploadState;
   source_url?: string;
@@ -1792,6 +1794,8 @@ export type ImportGithubResult =
       needs_confirm: true;
       repo?: string;
       ref?: string;
+      /** 仓库在托管平台上的规范地址（GitHub / GitLab 由后端决定）。 */
+      web_url?: string;
       estimated_bytes: number;
       limit_bytes: number;
       hard_limit_bytes: number;
@@ -1803,6 +1807,7 @@ export type ImportGithubResult =
       state: TaskUploadState;
       repo?: string;
       ref?: string;
+      web_url?: string;
       created_at?: string;
     };
 

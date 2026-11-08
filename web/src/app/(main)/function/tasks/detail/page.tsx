@@ -585,7 +585,9 @@ function TaskDetailInner() {
               title={`源码来源：${task.source_url} @ ${task.source_commit}`}
             >
               <GitBranchIcon className="size-3 shrink-0" />
-              <span className="truncate">{(task.source_url ?? "").replace(/^https?:\/\/github\.com\//, "")}</span>
+              <span className="truncate">
+                {(task.source_url ?? "").replace(/^https?:\/\/(www\.)?(github|gitlab)\.com\//, "")}
+              </span>
               <code className="shrink-0 font-mono">{task.source_commit.slice(0, 7)}</code>
             </a>
           ) : null}

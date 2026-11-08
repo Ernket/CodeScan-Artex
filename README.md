@@ -24,7 +24,7 @@ SCA Audit 把「审计一个代码仓库」拆成**可并行的意图**，交给
 
 **只做静态分析。** **审计运行期**不发起任何网络请求、不执行任何系统命令、不做任何运行时验证——结论必须由源码证据支撑。这不是靠提示词约束，而是**在工具装配层物理删除**（见下节）。
 
-唯一的例外是**平台自身**的源码搬运：创建任务时可以由服务端去 GitHub 下载公开仓库的 zipball（`githubsrc/`），产出一个和手动上传 zip 完全相同的源码目录。这条通道只出站到 `github.com` / `api.github.com` / `codeload.github.com` / `objects.githubusercontent.com`（域名白名单 + 逐跳重定向校验 + 拨号期拒绝环回/内网/链路本地地址），不接受用户传入的任意 URL——请求地址由解析后的 `{owner,repo,ref}` 重新拼装，因此不存在 SSRF 面。Agent 侧一行的权限都没有放宽：下载发生在 Agent 启动之前，Agent 看到的仍然只是本地只读源码。
+唯一的例外是**平台自身**的源码搬运：创建任务时可以由服务端去 GitHub 或 GitLab 下载公开仓库的归档包（`githubsrc/`），产出一个和手动上传 zip 完全相同的源码目录。这条通道只出站到 `github.com` / `api.github.com` / `codeload.github.com` / `objects.githubusercontent.com` / `gitlab.com`（域名白名单 + 逐跳重定向校验 + 拨号期拒绝环回/内网/链路本地地址），不接受用户传入的任意 URL——请求地址由解析后的 `{provider,path,ref}` 重新拼装，因此不存在 SSRF 面。Agent 侧一行的权限都没有放宽：下载发生在 Agent 启动之前，Agent 看到的仍然只是本地只读源码。
 
 ---
 

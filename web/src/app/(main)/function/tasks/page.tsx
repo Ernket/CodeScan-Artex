@@ -3254,7 +3254,7 @@ function CategoryManagementSheet({
 }
 
 // ---------------------------------------------------------------------
-// GitHub 源码导入
+// 仓库源码导入（GitHub / GitLab）
 //
 // 与 zip 上传共用同一个 sourceUpload 状态：导入成功后拿到 upload_id，后续
 // 「创建任务」的路径完全一样，后端也不需要区分来源。这里只负责四件事：
@@ -3308,7 +3308,7 @@ function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChan
   async function start(confirmLarge: boolean, snapshot?: { url: string; ref: string }) {
     const target = snapshot ?? { url: url.trim(), ref: ref.trim() };
     if (!target.url) {
-      toast.error("请填写 GitHub 仓库地址");
+      toast.error("请填写仓库地址");
       return;
     }
     setStarting(true);
@@ -3336,7 +3336,8 @@ function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChan
         total_bytes: 0,
         origin: "github",
         state: res.state,
-        source_url: res.repo ? `https://github.com/${res.repo}` : target.url,
+        // 后端按来源给规范地址：github.com 或 gitlab.com（GitLab 可能是多级子组）。
+        source_url: res.web_url ?? target.url,
         source_ref: res.ref ?? target.ref,
       });
       toast.success("已开始拉取源码");
@@ -3382,9 +3383,9 @@ function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChan
         <Input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://github.com/owner/repo"
+          placeholder="https://github.com/owner/repo 或 https://gitlab.com/group/project"
           disabled={starting}
-          aria-label="GitHub 仓库地址"
+          aria-label="仓库地址"
         />
         <div className="flex gap-2">
           <Input
@@ -3465,7 +3466,7 @@ function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChan
       <div className="grid gap-2 rounded-lg border px-3 py-3">
         <div className="flex items-center gap-2 text-sm">
           <Loader2Icon className="text-muted-foreground size-4 shrink-0 animate-spin" />
-          {state === "extracting" ? "正在解压源码…" : "正在从 GitHub 拉取源码…"}
+          {state === "extracting" ? "正在解压源码…" : "正在拉取源码…"}
           <span className="text-muted-foreground ml-auto text-xs tabular-nums">
             {state === "extracting" ? "" : `已下载 ${fmtBytes(value.downloaded_bytes ?? 0)}`}
           </span>
@@ -3489,7 +3490,7 @@ function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChan
       <span className="min-w-0 flex-1 truncate text-sm font-medium" title={value.source_url ?? value.filename}>
         {value.filename}
       </span>
-      {/* 不再补一段短 commit：GitHub 来源的 filename 本身就是 `owner/repo@sha7`，
+      {/* 不再补一段短 commit：仓库来源的 filename 本身就是 `owner/repo@sha7`，
           再拼一次会变成「repo@f32a86a · f32a86a」。 */}
       <span className="text-muted-foreground text-xs whitespace-nowrap tabular-nums">
         {value.file_count} 个文件 · {fmtBytes(value.total_bytes)}
@@ -3680,7 +3681,7 @@ function CreateTaskSheet({
     // 源码：所有账号都必须带 upload_id（后端同样强校验）。没有源码的任务读不到代码，
     // 而且创建之后没有任何入口能补源码，所以这里提前拦下。
     if (!sourceUpload) {
-      toast.error(sourceMode === "github" ? "请先导入 GitHub 仓库源码" : "请先上传 .zip 源码包");
+      toast.error(sourceMode === "github" ? "请先导入仓库源码" : "请先上传 .zip 源码包");
       return;
     }
     // 只有 ready 能被后端消费：awaiting_confirm 时后端会拒绝，提前拦下给出可读原因。
@@ -3767,14 +3768,14 @@ function CreateTaskSheet({
         <SheetHeader className="border-b p-6">
           <SheetTitle>新建任务</SheetTitle>
           <SheetDescription>
-            先提供源码（上传 .zip 或导入 GitHub
+            先提供源码（上传 .zip 或导入 GitHub / GitLab
             仓库），再填写审计对象与目标。任务创建后不会自动开始，需要到任务详情页点「开启任务」。
           </SheetDescription>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-6">
           <div className="grid gap-5">
-            {/* 第一步：源码。上传 zip 或填 GitHub 链接，两种方式产出同一个 upload_id；
+            {/* 第一步：源码。上传 zip 或填仓库链接，两种方式产出同一个 upload_id；
                 创建任务时后端把源码搬进任务目录。 */}
             <Field>
               <FieldLabel htmlFor="source-zip">源码（必填）</FieldLabel>
@@ -3802,7 +3803,7 @@ function CreateTaskSheet({
                       // 已选好源码时不允许切换来源：否则会留下一个没人消费的 staging 目录。
                       disabled={Boolean(sourceUpload) && sourceMode !== mode}
                     >
-                      {mode === "upload" ? "上传 zip" : "GitHub 链接"}
+                      {mode === "upload" ? "上传 zip" : "仓库链接"}
                     </TabsTrigger>
                   ))}
                 </TabsList>
@@ -3879,11 +3880,11 @@ function CreateTaskSheet({
                   <GithubSourceBox value={sourceUpload} onChange={setSourceUpload} />
                 </TabsContent>
               </Tabs>
-              {/* 两种来源各说一句，且只说一次：GitHub 的提示由这里统一给，
+              {/* 两种来源各说一句，且只说一次：仓库导入的提示由这里统一给，
                   GithubSourceBox 内部不再重复（否则同一段话会出现两遍）。 */}
               <FieldDescription>
                 {sourceMode === "github"
-                  ? "仅支持公开仓库。导入会固定到具体 commit，便于事后回溯；源码包不含 .git、submodule 与 Git LFS 实体。"
+                  ? "支持 GitHub / GitLab 公开仓库。导入会固定到具体 commit，便于事后回溯；源码包不含 .git、submodule 与 Git LFS 实体。GitLab 仓库不设体积上限，请自行确认仓库大小。"
                   : "源码包是创建任务的必填项。上传后自动解压，创建任务时由 Agent 按源码目录做审计。"}
               </FieldDescription>
             </Field>

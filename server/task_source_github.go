@@ -21,11 +21,12 @@ import (
 )
 
 // =====================================================================
-// GitHub 仓库导入（任务创建流程的另一个入口）
+// 仓库源码导入（任务创建流程的另一个入口）
 //
-// 设计见 docs/github-source-import.md。要点：导入产出与「上传 zip」完全相同的
-// staging 目录（data/uploads/<id>/source + 一行 task_uploads），因此 createTask /
-// attachUploadToTask / agent 提示词全都不需要改动。
+// 支持 github.com 与 gitlab.com 的公开仓库。设计见 docs/github-source-import.md。
+// 要点：导入产出与「上传 zip」完全相同的 staging 目录（data/uploads/<id>/source
+// + 一行 task_uploads），因此 createTask / attachUploadToTask / agent 提示词
+// 全都不需要改动。
 //
 // 为什么必须异步：codeload 不返回 Content-Length，实测 7.86 MB 的包在慢链路上
 // 要下 2 分 50 秒，同步 POST 会被任何默认 nginx（proxy_read_timeout 60s）掐成 504。
@@ -96,7 +97,7 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 
 	cfg := config.GitHubSettings()
 	if cfg.Disabled {
-		writeErr(w, 503, "GitHub 导入功能已关闭")
+		writeErr(w, 503, "仓库导入功能已关闭")
 		return
 	}
 
@@ -130,9 +131,12 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	estimate := meta.SizeKB * 1024
-	if estimate < 0 {
-		estimate = 0
+	estimate := int64(0)
+	if meta.SizeKnown {
+		estimate = meta.SizeKB * 1024
+		if estimate < 0 {
+			estimate = 0
+		}
 	}
 	// 估算超过硬上限时**不拒**，只多给前端一个标记。
 	//
@@ -140,11 +144,15 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 	// ernket.github.io 低估 23%（zip 比 size 大）。高估方向下按估算硬拒，会把
 	// 本来能导的仓库挡在门外；而低估方向下拦也拦不住。真正的闸门只能是下载时的
 	// 精确字节数（见 errTooLargeHard），估算只负责「问一句」。
-	if estimate > cfg.MaxZipBytes && !req.ConfirmLarge {
+	//
+	// GitLab 匿名请求拿不到 statistics.repository_size，SizeKnown=false、估算为 0：
+	// 不预估，也就不问这一句（Product 决定：GitLab 不设体积上限，见 runGithubImport）。
+	if cfg.MaxZipBytes > 0 && estimate > cfg.MaxZipBytes && !req.ConfirmLarge {
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"needs_confirm":         true,
 			"repo":                  sp.String(),
 			"ref":                   sp.Ref,
+			"web_url":               sp.WebURL(),
 			"estimated_bytes":       estimate,
 			"limit_bytes":           cfg.MaxZipBytes,
 			"hard_limit_bytes":      cfg.HardMaxZipBytes,
@@ -177,7 +185,7 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 	}
 	sourceDir := filepath.Join(dir, "source")
 	createdBy := me.ID
-	filename := fmt.Sprintf("%s/%s@%s", sp.Owner, sp.Repo, shortSHA(commit))
+	filename := fmt.Sprintf("%s@%s", sp.String(), shortSHA(commit))
 
 	up, err := s.m.pg.TaskUploads().CreateTaskUpload(db.NewTaskUpload{
 		ID:             uploadID,
@@ -185,8 +193,12 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 		StoredPath:     "", // 不保留原始归档（解压后即删）
 		SourcePath:     sourceDir,
 		CreatedBy:      &createdBy,
+		// "github" 在这里的含义是「从代码托管平台拉取」，GitHub 与 GitLab 共用
+		// 同一个值：它是已经落库的判别值（决定详情页显示 commit 角标、创建任务时
+		// 走 source 目录而非 zip），拆成两个值需要数据迁移，收益只是名字好听。
+		// 真正的平台差异看 SourceURL 的主机名。
 		Origin:         "github",
-		SourceURL:      "https://github.com/" + sp.String(),
+		SourceURL:      sp.WebURL(),
 		SourceRef:      sp.Ref,
 		ResolvedCommit: commit,
 		State:          db.UploadStateFetching,
@@ -210,7 +222,11 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 		confirm: make(chan bool, 1),
 	}
 	s.importJobs.Store(uploadID, job)
-	go s.runGithubImport(ctx, uploadID, sp, commit, meta.Name+"-", req.ConfirmLarge, cfg, job)
+	jobCfg := cfg
+	if sp.Provider == githubsrc.ProviderGitLab {
+		jobCfg = unlimitedImport(cfg)
+	}
+	go s.runGithubImport(ctx, uploadID, sp, commit, meta.Name+"-", req.ConfirmLarge, jobCfg, job)
 
 	log.Printf("[github] %s ← %s@%s（估算 %.1f MB）", uploadID, sp.String(), shortSHA(commit), float64(estimate)/(1<<20))
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -218,8 +234,24 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 		"state":      up.State,
 		"repo":       sp.String(),
 		"ref":        sp.Ref,
+		"web_url":    sp.WebURL(),
 		"created_at": up.CreatedAt,
 	})
+}
+
+// unlimitedImport 关掉 GitLab 导入的所有体积/文件数闸门。
+//
+// GitLab 的归档接口是 chunked、匿名又拿不到 statistics，体积在下载完成前**无法
+// 预估**；按产品决定不做「估算截断」，由用户在发起前自行判断（下载中仍可点
+// 「取消导入」随时停止）。注意这与 GitHub 不同：GitHub 保留软/硬上限。
+// 上限用 0 表示不限制，extractZipArchiveOpts 用负数表示不限制。
+func unlimitedImport(cfg config.GitHubImport) config.GitHubImport {
+	cfg.MaxZipBytes = 0
+	cfg.HardMaxZipBytes = 0
+	cfg.MaxExtractBytes = -1
+	cfg.HardMaxExtractBytes = -1
+	cfg.MaxFiles = -1
+	return cfg
 }
 
 // GET /api/task-uploads/{id} — 轮询导入状态。
@@ -323,7 +355,12 @@ func (s *Server) runGithubImport(ctx context.Context, id string, sp githubsrc.Sp
 		return fmt.Errorf("写入临时文件失败: %w", err)
 	}
 	pw := &uploadProgressWriter{f: f, id: id, st: s.m.pg.TaskUploads(), last: time.Now()}
-	n, copyErr := io.Copy(pw, io.LimitReader(body, cfg.HardMaxZipBytes+1))
+	// 0 = 不设上限（GitLab）：归档是 chunked、体积无从预估，按产品决定不截断。
+	reader := io.Reader(body)
+	if cfg.HardMaxZipBytes > 0 {
+		reader = io.LimitReader(body, cfg.HardMaxZipBytes+1)
+	}
+	n, copyErr := io.Copy(pw, reader)
 	closeErr := f.Close()
 	if copyErr != nil {
 		if dlCtx.Err() != nil && ctx.Err() == nil {
@@ -337,12 +374,12 @@ func (s *Server) runGithubImport(ctx context.Context, id string, sp githubsrc.Sp
 	if n == 0 {
 		return fmt.Errorf("%w：下载内容为空", errNotZip)
 	}
-	if n > cfg.HardMaxZipBytes {
+	if cfg.HardMaxZipBytes > 0 && n > cfg.HardMaxZipBytes {
 		// 硬上限不弹窗：它是防止误操作撑爆磁盘的底线，能被点掉就等于没有上限。
 		return fmt.Errorf("%w：实际大小超过 %d MiB，导入已终止", errTooLargeHard, cfg.HardMaxZipBytes>>20)
 	}
 
-	if n > cfg.MaxZipBytes && !sizeConfirmed {
+	if cfg.MaxZipBytes > 0 && n > cfg.MaxZipBytes && !sizeConfirmed {
 		ok, mErr := s.m.pg.TaskUploads().MarkTaskUploadAwaitingConfirm(id, n)
 		if mErr != nil {
 			return mErr
@@ -537,9 +574,9 @@ func importGithubMessage(err error) string {
 	case errors.Is(err, githubsrc.ErrEmptyRepo):
 		return "仓库为空，没有可审计的源码"
 	case errors.Is(err, githubsrc.ErrRepoBlocked):
-		return "该仓库已被 GitHub 以版权/合规原因屏蔽（HTTP 451），无法导入"
+		return "该仓库已被平台以版权/合规原因屏蔽（HTTP 451），无法导入"
 	case errors.Is(err, githubsrc.ErrRateLimited):
-		return "GitHub 接口限流（未登录每小时 60 次），请稍后重试"
+		return "代码托管平台接口限流，请稍后重试"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "拉取超时，请检查网络或改用更小的仓库"
 	case errors.Is(err, context.Canceled):

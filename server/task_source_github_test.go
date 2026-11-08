@@ -183,7 +183,7 @@ func TestAttachUploadStateGate(t *testing.T) {
 	}
 }
 
-// TestUploadJanitorReclaimsExpiredStaging 覆盖四种行的回收与两种必须保留的行。
+// TestUploadJanitorReclaimsExpiredStaging 覆盖两类行的回收与三类必须保留的行。
 func TestUploadJanitorReclaimsExpiredStaging(t *testing.T) {
 	s := newGithubTestServer(t)
 	store := s.m.pg.TaskUploads()
@@ -225,7 +225,7 @@ func TestUploadJanitorReclaimsExpiredStaging(t *testing.T) {
 
 	s.runUploadJanitor()
 
-	for _, r := range []row{oldReady, oldFailed, oldAwait} {
+	for _, r := range []row{oldReady, oldFailed} {
 		if _, err := store.GetTaskUpload(r.id); err == nil {
 			t.Errorf("state=%s 超过 TTL 应被删除", r.state)
 		}
@@ -233,7 +233,10 @@ func TestUploadJanitorReclaimsExpiredStaging(t *testing.T) {
 			t.Errorf("state=%s 的目录应被删除", r.state)
 		}
 	}
-	for _, r := range []row{freshReady, oldFetching} {
+	// awaiting_confirm 刻意不由 janitor 回收（见 ExpiredTaskUploads 的注释）：
+	// goroutine 还在等用户点确认，按 created_at 删行会把活着的确认窗口打断。
+	// 它由确认超时（置 failed）和进程重启恢复兜底。
+	for _, r := range []row{freshReady, oldFetching, oldAwait} {
 		if _, err := store.GetTaskUpload(r.id); err != nil {
 			t.Errorf("state=%s 不该被回收: %v", r.state, err)
 		}
@@ -265,7 +268,7 @@ func TestUploadJanitorReclaimsExpiredStaging(t *testing.T) {
 		t.Error("宽限期内的目录不该被清理（可能正在导入）")
 	}
 
-	for _, r := range []row{freshReady, oldFetching} {
+	for _, r := range []row{freshReady, oldFetching, oldAwait} {
 		_ = store.DeleteTaskUpload(r.id)
 	}
 }

@@ -16,17 +16,19 @@ func newTestClient(t *testing.T, h http.Handler) (*Client, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	c := newClient("", srv.URL, srv.URL, true, true)
+	c := newClient("", srv.URL, srv.URL, srv.URL+"/api/v4", true, true)
 	return c, srv
 }
 
 func TestCheckURL(t *testing.T) {
-	c := newClient("", defaultAPIBase, defaultCodeloadBase, false, false)
+	c := newClient("", defaultAPIBase, defaultCodeloadBase, defaultGitLabAPIBase, false, false)
 
 	ok := []string{
 		"https://api.github.com/repos/o/r",
 		"https://codeload.github.com/o/r/zip/abc",
 		"https://objects.githubusercontent.com/x",
+		"https://gitlab.com/api/v4/projects/g%2Fp",
+		"https://www.gitlab.com/g/p",
 	}
 	for _, raw := range ok {
 		u, _ := url.Parse(raw)
@@ -56,7 +58,7 @@ func TestRedirectToInternalHostIsRejected(t *testing.T) {
 		// 指向云元数据端点：即使 scheme 是 https，也不在白名单里。
 		http.Redirect(w, r, "https://169.254.169.254/latest/meta-data/", http.StatusFound)
 	}))
-	_, err := c.Repo(context.Background(), Spec{Owner: "o", Repo: "r"})
+	_, err := c.Repo(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r"})
 	if err == nil {
 		t.Fatal("重定向到元数据端点必须失败")
 	}
@@ -104,7 +106,7 @@ func TestRepoStatusMapping(t *testing.T) {
 			w.WriteHeader(tc.status)
 			_, _ = io.WriteString(w, `{"message":"x"}`)
 		}))
-		_, err := c.Repo(context.Background(), Spec{Owner: "o", Repo: "r"})
+		_, err := c.Repo(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r"})
 		if !errors.Is(err, tc.want) {
 			t.Errorf("status %d: 期望 %v，得到 %v", tc.status, tc.want, err)
 		}
@@ -118,7 +120,7 @@ func TestRepoCache(t *testing.T) {
 		_, _ = io.WriteString(w, `{"name":"Real-Name","size":10866}`)
 	}))
 	for i := 0; i < 3; i++ {
-		info, err := c.Repo(context.Background(), Spec{Owner: "o", Repo: "r"})
+		info, err := c.Repo(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r"})
 		if err != nil {
 			t.Fatalf("Repo: %v", err)
 		}
@@ -150,7 +152,7 @@ func TestResolveCommit(t *testing.T) {
 		_, _ = io.WriteString(w, `{"sha":"`+strings.ToUpper(sha)+`"}`)
 	}))
 
-	got, err := c.ResolveCommit(context.Background(), Spec{Owner: "o", Repo: "r", Ref: "feat/a/b"})
+	got, err := c.ResolveCommit(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r", Ref: "feat/a/b"})
 	if err != nil {
 		t.Fatalf("ResolveCommit: %v", err)
 	}
@@ -161,15 +163,15 @@ func TestResolveCommit(t *testing.T) {
 		t.Errorf("含斜杠的分支名应保留层级，实际路径 %s", gotPath)
 	}
 
-	if _, err := c.ResolveCommit(context.Background(), Spec{Owner: "o", Repo: "r", Ref: "nope"}); !errors.Is(err, ErrRefNotFound) {
+	if _, err := c.ResolveCommit(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r", Ref: "nope"}); !errors.Is(err, ErrRefNotFound) {
 		t.Errorf("不存在的分支应为 ErrRefNotFound，得到 %v", err)
 	}
 	// 422 同样要归到 ErrRefNotFound：分支名打错时 GitHub 给的是 422。
-	if _, err := c.ResolveCommit(context.Background(), Spec{Owner: "o", Repo: "r", Ref: "unprocessable"}); !errors.Is(err, ErrRefNotFound) {
+	if _, err := c.ResolveCommit(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r", Ref: "unprocessable"}); !errors.Is(err, ErrRefNotFound) {
 		t.Errorf("422 应为 ErrRefNotFound，得到 %v", err)
 	}
 	// 默认分支（Ref 为空）拿到 404 时不能谎报成分支不存在。
-	if _, err := c.ResolveCommit(context.Background(), Spec{Owner: "o", Repo: "nope"}); !errors.Is(err, ErrRepoNotFound) {
+	if _, err := c.ResolveCommit(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/nope"}); !errors.Is(err, ErrRepoNotFound) {
 		t.Errorf("未指定 ref 的 404 应保持 ErrRepoNotFound，得到 %v", err)
 	}
 }
@@ -182,7 +184,7 @@ func TestOpenArchiveStreamsBody(t *testing.T) {
 		}
 		_, _ = w.Write(payload)
 	}))
-	rc, size, err := c.OpenArchive(context.Background(), Spec{Owner: "o", Repo: "r"}, strings.Repeat("a", 40))
+	rc, size, err := c.OpenArchive(context.Background(), Spec{Provider: ProviderGitHub, Path: "o/r"}, strings.Repeat("a", 40))
 	if err != nil {
 		t.Fatalf("OpenArchive: %v", err)
 	}
@@ -193,5 +195,72 @@ func TestOpenArchiveStreamsBody(t *testing.T) {
 	}
 	if size != int64(len(payload)) {
 		t.Logf("Content-Length = %d（codeload 真实环境为 -1，测试服务端会给出长度）", size)
+	}
+}
+
+// TestGitLabRepoCommitArchive 盯住 GitLab 的三条 URL 模板与响应字段。
+//
+// GitLab 与 GitHub 的差异不只是域名：项目路径要多级、且必须以 %2F 形式整体
+// 编码进 /projects/{id}；commit 用 id 而不是 sha；归档走 /repository/archive.zip。
+// 任何一处拼错都会在真实环境变成 404，所以这里逐条断言请求形态。
+func TestGitLabRepoCommitArchive(t *testing.T) {
+	const sha = "87e8c32b8918a836c09475e0f668ea7c436d3758"
+	payload := []byte("PK\x03\x04gitlab-zip")
+	var metaPath, commitPath, archiveURI string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repository/archive.zip"):
+			archiveURI = r.URL.RequestURI()
+			_, _ = w.Write(payload)
+		case strings.Contains(r.URL.Path, "/repository/commits/"):
+			commitPath = r.URL.EscapedPath()
+			_, _ = io.WriteString(w, `{"id":"`+strings.ToUpper(sha)+`"}`)
+		default:
+			metaPath = r.URL.EscapedPath()
+			// GitLab 元数据里没有 size/statistics（匿名请求），name 是显示名、
+			// path 才是归档包裹目录用的 slug。
+			_, _ = io.WriteString(w, `{"path":"project","name":"My Project"}`)
+		}
+	}))
+
+	sp := Spec{Provider: ProviderGitLab, Path: "group/sub/project"}
+	info, err := c.Repo(context.Background(), sp)
+	if err != nil {
+		t.Fatalf("Repo: %v", err)
+	}
+	if info.Name != "project" {
+		t.Errorf("包裹目录前缀应取 path 而不是显示名，得到 %q", info.Name)
+	}
+	if info.SizeKnown || info.SizeKB != 0 {
+		t.Errorf("匿名 GitLab 元数据不应有体积估算，得到 size=%d known=%v", info.SizeKB, info.SizeKnown)
+	}
+	if !strings.HasPrefix(metaPath, "/api/v4/projects/group%2Fsub%2Fproject") {
+		t.Errorf("项目路径应在 /api/v4 下并整体编码成 %%2F 形式，实际 %s", metaPath)
+	}
+
+	got, err := c.ResolveCommit(context.Background(), sp)
+	if err != nil {
+		t.Fatalf("ResolveCommit: %v", err)
+	}
+	if got != sha {
+		t.Errorf("应读取 GitLab 的 id 并统一小写，得到 %s", got)
+	}
+	if !strings.HasSuffix(commitPath, "/repository/commits/HEAD") {
+		t.Errorf("默认分支应解析为 HEAD，实际 %s", commitPath)
+	}
+
+	rc, _, err := c.OpenArchive(context.Background(), sp, sha)
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer rc.Close()
+	body, _ := io.ReadAll(rc)
+	if string(body) != string(payload) {
+		t.Errorf("归档内容不一致: %q", body)
+	}
+	// 归档接口同样在 /api/v4 下：少了这个前缀会落到 GitLab 网页路由，实测返回 403。
+	if !strings.HasPrefix(archiveURI, "/api/v4/projects/group%2Fsub%2Fproject/repository/archive.zip") ||
+		!strings.Contains(archiveURI, "sha="+sha) {
+		t.Errorf("归档地址不对: %s", archiveURI)
 	}
 }

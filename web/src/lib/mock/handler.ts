@@ -1146,7 +1146,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/users") return { users: [mockAuthUser] };
   if (path === "/departments") return { departments: [{ id: 1, name: "安全审计部", description: "demo 部门" }] };
 
-  // ── GitHub 源码导入：demo 模式直接给一个已就绪的假上传 ──
+  // ── 仓库源码导入（GitHub / GitLab）：demo 模式直接给一个已就绪的假上传 ──
   // 走 http() 的请求会被这里拦下，未命中的一律返回 {}，界面会卡在既不是 loading
   // 也不是失败的中间态，所以这两条必须显式实现。
   if (path === "/tasks/import/github" && m === "POST") {
@@ -1155,6 +1155,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       state: "ready",
       repo: "demo/repo",
       ref: "",
+      web_url: "https://github.com/demo/repo",
       created_at: new Date().toISOString(),
     };
   }
