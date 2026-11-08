@@ -52,11 +52,131 @@ type JavaDecompiler struct {
 	LocalRepo string `json:"local_repo"`
 }
 
+// GitHubImport configures importing a public repository as task source
+// (see docs/github-source-import.md). Zero values mean "use the defaults", so an
+// absent config block keeps the feature on with sane limits.
+type GitHubImport struct {
+	// Disabled turns the whole feature off; every import request answers 503.
+	Disabled bool `json:"disabled"`
+	// MaxZipBytes is the soft limit. Downloading is never interrupted for it:
+	// codeload has no Range support, so stopping would mean re-downloading from
+	// zero. Instead the user is asked to confirm (before downloading, using the
+	// API's size estimate, or after, using the exact byte count).
+	MaxZipBytes int64 `json:"max_zip_bytes"`
+	// HardMaxZipBytes is never exceeded and cannot be confirmed away.
+	HardMaxZipBytes int64 `json:"hard_max_zip_bytes"`
+	// MaxExtractBytes applies when the user did not confirm a large import.
+	MaxExtractBytes int64 `json:"max_extract_bytes"`
+	// HardMaxExtractBytes is the ceiling after a confirmed import. Raising it with
+	// the confirmed zip size avoids "downloaded 1.2 GB but failed extracting".
+	HardMaxExtractBytes int64 `json:"hard_max_extract_bytes"`
+	// MaxFiles caps the entry count of one archive.
+	MaxFiles int `json:"max_files"`
+	// TimeoutSeconds bounds the download phase only (not the confirm wait).
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// ConfirmTimeoutSeconds is how long an awaiting_confirm row survives.
+	ConfirmTimeoutSeconds int `json:"confirm_timeout_seconds"`
+	// Proxy is an explicit proxy for GitHub traffic, empty = direct. The platform
+	// global proxy is deliberately not reused: it carries offensive traffic.
+	Proxy string `json:"proxy"`
+}
+
 // Config is the on-disk config file shape.
 type Config struct {
-	Database Database       `json:"database"`
-	SkillDir string         `json:"skill_dir"`
-	Java     JavaDecompiler `json:"java"`
+	Database     Database       `json:"database"`
+	SkillDir     string         `json:"skill_dir"`
+	Java         JavaDecompiler `json:"java"`
+	GitHubImport GitHubImport   `json:"github_import"`
+}
+
+// 默认限额。软/硬上限分开：软上限只是「问一句」，硬上限才是闸门。
+const (
+	defaultGitHubMaxZipMB         = 512
+	defaultGitHubHardMaxZipMB     = 4096
+	defaultGitHubMaxExtractMB     = 4096
+	defaultGitHubHardMaxExtractMB = 12288
+	defaultGitHubMaxFiles         = 100000
+	defaultGitHubTimeoutSeconds   = 600
+	defaultGitHubConfirmSeconds   = 600
+)
+
+// GitHubSettings resolves the import settings with precedence:
+//
+//	env (ARTEX_GITHUB_IMPORT / ARTEX_GITHUB_MAX_MB / ARTEX_GITHUB_HARD_MAX_MB /
+//	     ARTEX_GITHUB_MAX_EXTRACT_MB / ARTEX_GITHUB_TIMEOUT /
+//	     ARTEX_GITHUB_CONFIRM_TIMEOUT / ARTEX_GITHUB_PROXY)
+//	  >  config file (github_import.*)
+//	  >  defaults
+//
+// It never fails; impossible combinations are corrected instead of rejected so a
+// bad config cannot take the feature (or the process) down.
+func GitHubSettings() GitHubImport {
+	g := Load().GitHubImport
+
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_IMPORT")); v != "" {
+		g.Disabled = v == "0" || strings.EqualFold(v, "off") || strings.EqualFold(v, "false")
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_MAX_MB")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			g.MaxZipBytes = n << 20
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_HARD_MAX_MB")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			g.HardMaxZipBytes = n << 20
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_MAX_EXTRACT_MB")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			g.MaxExtractBytes = n << 20
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_TIMEOUT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			g.TimeoutSeconds = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_CONFIRM_TIMEOUT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			g.ConfirmTimeoutSeconds = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_PROXY")); v != "" {
+		g.Proxy = v
+	}
+
+	if g.MaxZipBytes <= 0 {
+		g.MaxZipBytes = defaultGitHubMaxZipMB << 20
+	}
+	// 硬上限必须先落默认值再做「不小于软上限」的纠正。只做纠正是不够的：
+	// 配置文件缺失时 HardMaxZipBytes 是 0，会被直接抬成软上限，于是「512 MiB
+	// 问一句、4 GiB 才硬拦」退化成两者都是 512 MiB —— 确认弹窗从此再也放不过
+	// 任何大仓库（单测 TestGitHubSettingsDefaultsAndEnv 就是照这个坑写的）。
+	if g.HardMaxZipBytes <= 0 {
+		g.HardMaxZipBytes = defaultGitHubHardMaxZipMB << 20
+	}
+	if g.HardMaxZipBytes < g.MaxZipBytes {
+		g.HardMaxZipBytes = g.MaxZipBytes
+	}
+	if g.MaxExtractBytes <= 0 {
+		g.MaxExtractBytes = defaultGitHubMaxExtractMB << 20
+	}
+	if g.HardMaxExtractBytes <= 0 {
+		g.HardMaxExtractBytes = defaultGitHubHardMaxExtractMB << 20
+	}
+	if g.HardMaxExtractBytes < g.MaxExtractBytes {
+		g.HardMaxExtractBytes = g.MaxExtractBytes
+	}
+	if g.MaxFiles <= 0 {
+		g.MaxFiles = defaultGitHubMaxFiles
+	}
+	if g.TimeoutSeconds <= 0 {
+		g.TimeoutSeconds = defaultGitHubTimeoutSeconds
+	}
+	if g.ConfirmTimeoutSeconds <= 0 {
+		g.ConfirmTimeoutSeconds = defaultGitHubConfirmSeconds
+	}
+	return g
 }
 
 // JavaSettings resolves the Java decompiler settings with precedence:

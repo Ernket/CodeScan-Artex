@@ -1146,6 +1146,39 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/users") return { users: [mockAuthUser] };
   if (path === "/departments") return { departments: [{ id: 1, name: "安全审计部", description: "demo 部门" }] };
 
+  // ── GitHub 源码导入：demo 模式直接给一个已就绪的假上传 ──
+  // 走 http() 的请求会被这里拦下，未命中的一律返回 {}，界面会卡在既不是 loading
+  // 也不是失败的中间态，所以这两条必须显式实现。
+  if (path === "/tasks/import/github" && m === "POST") {
+    return {
+      upload_id: "mock-gh-1",
+      state: "ready",
+      repo: "demo/repo",
+      ref: "",
+      created_at: new Date().toISOString(),
+    };
+  }
+  if (/^\/task-uploads\/[^/]+\/confirm$/.test(path) && m === "POST") {
+    return { state: "extracting" };
+  }
+  if (/^\/task-uploads\/[^/]+$/.test(path) && m === "GET") {
+    return {
+      upload_id: "mock-gh-1",
+      filename: "demo/repo@abc1234",
+      origin: "github",
+      state: "ready",
+      source_url: "https://github.com/demo/repo",
+      resolved_commit: "abc1234def5678abc1234def5678abc1234def56",
+      file_count: 128,
+      total_bytes: 2_400_000,
+      downloaded_bytes: 1_200_000,
+      declared_bytes: 1_500_000,
+      size_confirmed: false,
+      entries: ["src", "README.md"],
+      created_at: new Date().toISOString(),
+    };
+  }
+
   // ── task cold archives ──
   if (path === "/task-archives" && m === "GET") {
     const page = Math.max(1, Number(q.get("page")) || 1);

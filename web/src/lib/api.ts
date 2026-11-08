@@ -110,6 +110,7 @@ import type {
   DepartmentMembershipInput,
   Permissions,
   TaskUpload,
+  ImportGithubResult,
   TaskDependency,
   TaskDependencyList,
   TaskDepsImportResult,
@@ -351,6 +352,21 @@ export const api = {
   // 未消费的上传（刷新页面后可以继续创建任务；放弃时删除）。
   taskUploads: () => get<{ uploads: TaskUpload[] }>("/tasks/uploads").then((r) => arr(r.uploads)),
   deleteTaskUpload: (uploadId: string) => del<{ deleted: string }>(`/tasks/uploads/${encodeURIComponent(uploadId)}`),
+
+  // ---- GitHub 仓库导入（见 docs/github-source-import.md）----
+  // importFromGithub 第一次调用可能返回 needs_confirm（仓库体积超过软上限）：
+  // 此时后端没有建行也没有下载，带 confirmLarge=true 重发即可。
+  importFromGithub: (repoUrl: string, ref?: string, confirmLarge?: boolean, signal?: AbortSignal) =>
+    http<ImportGithubResult>("/tasks/import/github", {
+      method: "POST",
+      body: JSON.stringify({ repo_url: repoUrl, ref: ref ?? "", confirm_large: confirmLarge ?? false }),
+      signal,
+    }),
+  // taskUpload 轮询一次导入状态。注意路径是 task-uploads 而不是 tasks/uploads：
+  // 后者与 /tasks/{id}/coverage 是二义路由，后端注册会 panic。
+  taskUpload: (id: string) => get<TaskUpload>(`/task-uploads/${encodeURIComponent(id)}`),
+  confirmTaskUpload: (id: string, accept: boolean) =>
+    post<{ state: string }>(`/task-uploads/${encodeURIComponent(id)}/confirm`, { accept }),
   // 手动开启任务：新建的任务不会自动开跑，用户进任务详情后点「开启任务」。
   startTask: (id: string) => post<Task>(`/tasks/${encodeURIComponent(id)}/start`),
   // 管理员调整任务归属部门（null = 移出部门）。

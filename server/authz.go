@@ -49,12 +49,14 @@ func (s *Server) guardTaskAccess(next http.Handler) http.Handler {
 			if t, ok := s.m.Task(m[1]); ok && t != nil {
 				access := s.taskAccessFor(u, t)
 				switch {
+				case !access.View:
+					// 先判可见性：不可见的任务一律按不存在处理，读和写都必须返回 404。
+					// 否则「写方法返回 403、读方法返回 404」会变成存在性探针——跨部门
+					// 账号能靠状态码区分「这个任务存在但无权写」和「这个任务不存在」。
+					writeErr(w, 404, "task not found")
+					return
 				case write && !access.Write:
 					writeErr(w, 403, "只读权限：部门访客不能修改或控制任务")
-					return
-				case !write && !access.View:
-					// 不暴露「存在但无权查看」的任务，统一按不存在处理。
-					writeErr(w, 404, "task not found")
 					return
 				}
 			} else if !u.IsAdmin {
@@ -70,7 +72,14 @@ func (s *Server) guardTaskAccess(next http.Handler) http.Handler {
 			strings.HasPrefix(r.URL.Path, "/api/conversations/")) {
 			if tid := strings.TrimSpace(r.URL.Query().Get("task")); tid != "" {
 				if t, ok := s.m.Task(tid); ok && t != nil {
-					if !s.taskWriteAllowed(u, t) {
+					// 与任务守卫同序：先判可见性（不可见一律 404），再判写权限。
+					// 否则「别人的任务返回 403、不存在的任务返回 404」又成了存在性探针。
+					access := s.taskAccessFor(u, t)
+					if !access.View {
+						writeErr(w, 404, "task not found")
+						return
+					}
+					if !access.Write {
 						writeErr(w, 403, "只读权限：部门访客不能发起对话")
 						return
 					}
@@ -103,13 +112,48 @@ func (s *Server) requireBatchTaskWrite(w http.ResponseWriter, r *http.Request, i
 	if u.IsAdmin {
 		return true
 	}
-	for _, id := range ids {
-		t, ok := s.m.Task(strings.TrimSpace(id))
-		if !ok || t == nil {
-			continue // 不存在的任务交给各自的 handler 报 "task not found"
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if t, ok := s.m.Task(id); ok && t != nil {
+			// 与 guardTaskAccess 同序：先可见性（不可见一律 404，别让 403/404 的差别
+			// 成为「这个任务存在」的探针），再写权限。
+			access := s.taskAccessFor(u, t)
+			if !access.View {
+				writeErr(w, 404, "task not found")
+				return false
+			}
+			if !access.Write {
+				writeErr(w, 403, "只读权限：部门访客不能修改或控制任务（任务 #"+t.ID+"）")
+				return false
+			}
+			continue
 		}
-		if !s.taskWriteAllowed(u, t) {
-			writeErr(w, 403, "只读权限：部门访客不能修改或控制任务（任务 #"+t.ID+"）")
+		// 内存里没有（历史/归档/刚删除/尚未加载）不能直接跳过：跳过等于把
+		// 「路径里没有任务 id」的批量接口当成越权写入口——传一个别的部门的历史
+		// 任务 id 就能越过守卫。回落到数据库按同一套部门/创建者规则判定：
+		// 查不到或不可见一律 404（与 guardTaskAccess 同口径，状态码不当存在性探针），
+		// 可见但只读 403。
+		numeric, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			writeErr(w, 404, "task not found")
+			return false
+		}
+		row, err := s.m.pg.GetTask(numeric)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return false
+		}
+		if row == nil {
+			writeErr(w, 404, "task not found")
+			return false
+		}
+		access := accessForOwner(u, row.DepartmentID, row.CreatedBy)
+		if !access.View {
+			writeErr(w, 404, "task not found")
+			return false
+		}
+		if !access.Write {
+			writeErr(w, 403, "只读权限：部门访客不能修改或控制任务（任务 #"+id+"）")
 			return false
 		}
 	}
@@ -290,12 +334,12 @@ func (s *Server) startTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "任务已暂停，请使用「继续」")
 		return
 	}
+	// 无源码的任务开不动：planner 的提示词假定 source/ 存在，worker 读不到任何
+	// 文件，只会白烧 token 并产出 0 发现。这里不再给管理员开后门（以前是记条日志
+	// 就放行），存量无源码任务请删除后重建。
 	if strings.TrimSpace(t.SourcePath) == "" {
-		if me := currentUser(r); me == nil || !me.IsAdmin {
-			writeErr(w, 400, "该任务还没有源码包，请重新上传后再开启")
-			return
-		}
-		log.Printf("[task] 管理员开启无源码任务 #%s（未上传源码包）", t.ID)
+		writeErr(w, 400, "该任务没有源码包，无法开启审计；请删除本任务后重新创建并上传源码")
+		return
 	}
 	// 没装 LLM 就开不动：engine 处于 idle，任务会一直停在 created，用户只会看到
 	// 「点了开启但状态没变」。这里直接说清楚要去哪配，而不是返回 200 让人干等。

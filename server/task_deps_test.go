@@ -92,6 +92,8 @@ func TestDepsAPIIngestDoesNotDecompile(t *testing.T) {
 	// is both faithful to production and the only way the handlers can find it.
 	cb, _ := json.Marshal(map[string]any{
 		"description": "依赖API测试", "goal": "验证入库不反编译", "seedFirstIntent": false,
+		// 源码是建任务的必填项（所有账号一致），先造一个 ready 的 staging 上传。
+		"upload_id": stageTestSource(t, s, "deps"),
 	})
 	cr := httptest.NewRequest("POST", "/api/tasks", bytes.NewReader(cb))
 	cr.Header.Set("Authorization", "Bearer "+tok)
@@ -461,10 +463,10 @@ func TestDependencyToolRunawayGuard(t *testing.T) {
 	// Pretend maxMaterializedPerTask dependencies are already readable.
 	for i := 0; i < maxMaterializedPerTask; i++ {
 		if _, err := pg.Dependencies().UpsertDependency(&db.Dependency{
-			TaskID: taskID,
-			Artifact: "lib" + strconv.Itoa(i),
-			Version:  "1.0",
-			JarPath:  "deps/jars/lib" + strconv.Itoa(i) + "-1.0.jar",
+			TaskID:    taskID,
+			Artifact:  "lib" + strconv.Itoa(i),
+			Version:   "1.0",
+			JarPath:   "deps/jars/lib" + strconv.Itoa(i) + "-1.0.jar",
 			GAVSource: "filename",
 		}); err != nil {
 			t.Fatal(err)

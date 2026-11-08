@@ -21,6 +21,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/githubsrc"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
@@ -42,6 +43,11 @@ type Server struct {
 	m      *Manager
 	engine *Engine
 	ctx    context.Context
+
+	// GitHub 源码导入（见 task_source_github.go）。client 懒初始化，测试可注入。
+	githubMu   sync.Mutex
+	githubSrc  *githubsrc.Client
+	importJobs sync.Map // uploadID -> *githubImportJob
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -152,6 +158,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	// 收尾上次进程留下的半成品导入：残留的 fetching 行会永久占用
+	// (created_by) 上的部分唯一索引，该账号之后每次导入都会拿到 429。
+	s.recoverInterruptedGithubImports()
+	// staging 回收：未消费的上传会一直占着磁盘，且用户永远不会再看到它。
+	s.startUploadJanitor()
 	// 把旧版「单账号 + 单一密码」迁移成第一个管理员账号（仅当还没有任何账号时）。
 	s.migrateLegacyAdmin()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
@@ -222,8 +233,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg, s.dependencyToolSeeds()...) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
-		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
-		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		seedPrompts(m.pg)                                      // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
+		s.seedOrchestrationTools()                             // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
@@ -696,6 +707,12 @@ func (s *Server) Handler() http.Handler {
 	// 源码包上传（任务创建流程第一步）：上传 zip → 后端自动解压 → 建任务 → 手动开启。
 	mux.HandleFunc("POST /api/tasks/upload", s.uploadTaskSource)
 	mux.HandleFunc("GET /api/tasks/uploads", s.listTaskUploads)
+	// GitHub 仓库导入：服务端代下 zipball，产出与 zip 上传完全一致的 upload_id。
+	// 状态查询走顶层字面量 task-uploads —— /api/tasks/uploads/{id} 与
+	// /api/tasks/{id}/coverage 是二义模式，注册时会 panic（见 docs §5.5）。
+	mux.HandleFunc("POST /api/tasks/import/github", s.importTaskSourceGithub)
+	mux.HandleFunc("GET /api/task-uploads/{id}", s.getTaskUpload)
+	mux.HandleFunc("POST /api/task-uploads/{id}/confirm", s.confirmTaskUpload)
 	mux.HandleFunc("DELETE /api/tasks/uploads/{id}", s.deleteTaskUpload)
 	mux.HandleFunc("POST /api/tasks/{id}/start", s.startTask)
 	mux.HandleFunc("POST /api/tasks/{id}/department", s.requireAdmin(s.setTaskDepartment))
@@ -1577,10 +1594,12 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 源码包：web 建任务必须先上传压缩包（后端已经解压好，创建时搬进任务目录）。
-	// 管理员/编排路径可以不带源码（例如复现测试或先建任务后补代码）。
-	if strings.TrimSpace(req.UploadID) == "" && !me.IsAdmin {
-		writeErr(w, 400, "请先上传源码压缩包（zip）再创建任务")
+	// 源码包：所有账号建任务都必须带源码（上传压缩包或 GitHub 导入都已产出 upload_id）。
+	// 不给管理员开例外：没有源码的任务读不到任何文件，planner/worker 只会空转；
+	// 而且 attach 只发生在创建这一刻，建完之后【没有任何入口能补源码】。
+	// （spawn_task 走的是编排内部路径，不经过这里。）
+	if strings.TrimSpace(req.UploadID) == "" {
+		writeErr(w, 400, "请先上传源码压缩包或导入 GitHub 仓库再创建任务")
 		return
 	}
 	if strings.TrimSpace(req.Description) == "" {
@@ -1652,7 +1671,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 源码包搬家：把上传时解压好的目录放进本任务的目录，并记录 tasks.source_path。
-	if err := s.attachUploadToTask(t, req.UploadID); err != nil {
+	if err := s.attachUploadToTask(me, t, req.UploadID); err != nil {
 		// 任务已经建好但源码没挂上：删掉刚建的任务，避免留下一个没有代码的审计任务。
 		if _, derr := s.m.DeleteTask(t.ID, DeleteTaskOptions{DeleteFiles: true}); derr != nil {
 			log.Printf("[task] 清理失败任务的源码绑定: %v", derr)
@@ -1869,6 +1888,16 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := s.taskDTOWithAccess(r, t)
+	// 源码来源：从「被这个任务消费掉的那行上传」读，而不是在 tasks 表再存一份。
+	// 消费过的行不会被任何清理逻辑删除，所以这里永远查得到。
+	if taskID, err := parseTaskID(t.ID); err == nil {
+		if up, err := s.m.pg.TaskUploads().GetTaskUploadByTaskID(taskID); err == nil && up != nil {
+			dto.SourceOrigin = up.Origin
+			dto.SourceURL = up.SourceURL
+			dto.SourceRef = up.SourceRef
+			dto.SourceCommit = up.ResolvedCommit
+		}
+	}
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)

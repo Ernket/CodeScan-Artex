@@ -43,6 +43,11 @@ export interface Task {
   department_name?: string;
   created_by?: number | null; // 创建者账号 id
   source_path?: string; // 上传源码包解压后的目录（相对数据根），如 tasks/12/source
+  // 源码来源（仅 GitHub 导入时返回）：审计结论要能回溯到具体提交。
+  source_origin?: string;
+  source_url?: string;
+  source_ref?: string;
+  source_commit?: string;
   can_write?: boolean; // 当前账号对该任务是否有写权限（部门访客=false，前端据此只读）
 }
 
@@ -1753,6 +1758,8 @@ export interface Permissions {
 }
 
 /** 一次源码包上传（后端已解压到 staging，创建任务时消费）。 */
+export type TaskUploadState = "fetching" | "awaiting_confirm" | "extracting" | "ready" | "failed";
+
 export interface TaskUpload {
   upload_id: string;
   filename: string;
@@ -1760,7 +1767,44 @@ export interface TaskUpload {
   total_bytes: number;
   entries?: string[];
   created_at?: string;
+  // GitHub 导入（见 docs/github-source-import.md）。全部可选：本地上传与
+  // 旧响应都不带这些字段，前端按 undefined 处理。
+  origin?: "upload" | "github";
+  state?: TaskUploadState;
+  source_url?: string;
+  source_ref?: string;
+  resolved_commit?: string;
+  downloaded_bytes?: number;
+  declared_bytes?: number;
+  size_confirmed?: boolean;
+  error_message?: string;
+  /** 归属账号。抽屉恢复时按它过滤，避免接手别人正在下载的导入。 */
+  created_by?: number | null;
 }
+
+/**
+ * importFromGithub 的返回。两个分支靠 needs_confirm 判别：
+ * - 前者是「仓库体积超过软上限，请确认」，此时后端未建行、未下载，重发即可；
+ * - 后者表示后台已经开始拉取，用 upload_id 轮询状态。
+ */
+export type ImportGithubResult =
+  | {
+      needs_confirm: true;
+      repo?: string;
+      ref?: string;
+      estimated_bytes: number;
+      limit_bytes: number;
+      hard_limit_bytes: number;
+      /** 估算值已超硬上限。仅用于文案提示，前端不要据此阻断。 */
+      estimate_exceeds_hard?: boolean;
+    }
+  | {
+      upload_id: string;
+      state: TaskUploadState;
+      repo?: string;
+      ref?: string;
+      created_at?: string;
+    };
 
 /**
  * 第三方依赖（Java jar / .m2）——见 docs/java-m2依赖读取与反编译方案.md。

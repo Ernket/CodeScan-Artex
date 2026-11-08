@@ -26,6 +26,7 @@ import {
   EyeIcon,
   FileArchiveIcon,
   FolderInputIcon,
+  GitBranchIcon,
   GripVerticalIcon,
   Loader2Icon,
   PaperclipIcon,
@@ -147,6 +148,8 @@ import { cn } from "@/lib/utils";
 
 // fmtBytes renders a human file size for the upload manifest.
 function fmtBytes(n: number): string {
+  // 带 GB：硬上限 4 GiB 直接写成 4096.0 MB 既不好读，也容易和「4 MB」看串。
+  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GB`;
   if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
   if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KB`;
   return `${n} B`;
@@ -1356,9 +1359,7 @@ const TaskRow = React.memo(function TaskRow({
           const f = task.findings;
           const total = f ? f.critical + f.high + f.medium + f.low : 0;
           if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
-          const seg = (n: number, cls: string) => (
-            <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
-          );
+          const seg = (n: number, cls: string) => <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>;
           return (
             <span className="font-medium whitespace-nowrap" title="严重 / 高 / 中 / 低">
               {seg(f.critical, "text-rose-600 dark:text-rose-400")}
@@ -3252,6 +3253,254 @@ function CategoryManagementSheet({
   );
 }
 
+// ---------------------------------------------------------------------
+// GitHub 源码导入
+//
+// 与 zip 上传共用同一个 sourceUpload 状态：导入成功后拿到 upload_id，后续
+// 「创建任务」的路径完全一样，后端也不需要区分来源。这里只负责四件事：
+// 发起、轮询、确认大包、取消。
+// ---------------------------------------------------------------------
+type PendingLarge = {
+  url: string;
+  ref: string;
+  estimated: number;
+  limit: number;
+  hard: number;
+  /** 估算值已超硬上限：仍允许尝试，但要在弹窗里说清楚大概率会失败。 */
+  exceedsHard: boolean;
+};
+
+function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChange: (v: TaskUpload | null) => void }) {
+  const [url, setUrl] = React.useState("");
+  const [ref, setRef] = React.useState("");
+  const [starting, setStarting] = React.useState(false);
+  const [pending, setPending] = React.useState<PendingLarge | null>(null);
+
+  const state = value?.state ?? "ready";
+  const busy = state === "fetching" || state === "extracting";
+
+  // 轮询：fetching / extracting / awaiting_confirm 三种进行中的状态都要跟。
+  // awaiting_confirm 尤其不能漏：确认窗口在服务端有超时，无人应答时后台会把行置为
+  // failed，前端不轮询就会永远停在「是否继续解压」，用户既看不到失败原因也重试不了。
+  // 依赖里放的是「值」而不是整个对象，否则每 1.5 秒的 setState 都会重建定时器。
+  React.useEffect(() => {
+    if (!value || value.origin !== "github") return;
+    if (value.state !== "fetching" && value.state !== "extracting" && value.state !== "awaiting_confirm") return;
+    const id = value.upload_id;
+    let alive = true;
+    const timer = window.setInterval(() => {
+      api
+        .taskUpload(id)
+        .then((next) => {
+          if (alive) onChange(next);
+        })
+        .catch(() => {
+          /* 单次失败不打断轮询：服务端可能正在切状态 */
+        });
+    }, 1500);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value?.upload_id, value?.state, value?.origin]);
+
+  async function start(confirmLarge: boolean, snapshot?: { url: string; ref: string }) {
+    const target = snapshot ?? { url: url.trim(), ref: ref.trim() };
+    if (!target.url) {
+      toast.error("请填写 GitHub 仓库地址");
+      return;
+    }
+    setStarting(true);
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 30_000);
+    try {
+      const res = await api.importFromGithub(target.url, target.ref, confirmLarge, ctrl.signal);
+      if ("needs_confirm" in res) {
+        // 后端此时没有建行、没有下载，直接重发即可，不会留下脏状态。
+        setPending({
+          url: target.url,
+          ref: target.ref,
+          estimated: res.estimated_bytes,
+          limit: res.limit_bytes,
+          hard: res.hard_limit_bytes,
+          exceedsHard: Boolean(res.estimate_exceeds_hard),
+        });
+        return;
+      }
+      setPending(null);
+      onChange({
+        upload_id: res.upload_id,
+        filename: `${res.repo ?? target.url}${res.ref ? `@${res.ref}` : ""}`,
+        file_count: 0,
+        total_bytes: 0,
+        origin: "github",
+        state: res.state,
+        source_url: res.repo ? `https://github.com/${res.repo}` : target.url,
+        source_ref: res.ref ?? target.ref,
+      });
+      toast.success("已开始拉取源码");
+    } catch (e) {
+      const err = e as Error;
+      toast.error(err.name === "AbortError" ? "发起导入超时，请稍后重试" : `发起导入失败：${err.message}`);
+    } finally {
+      window.clearTimeout(timer);
+      setStarting(false);
+    }
+  }
+
+  async function decide(accept: boolean) {
+    if (!value) return;
+    try {
+      await api.confirmTaskUpload(value.upload_id, accept);
+      if (accept) {
+        onChange({ ...value, state: "extracting" });
+      } else {
+        onChange(null);
+      }
+    } catch (e) {
+      toast.error("操作失败：" + (e as Error).message);
+    }
+  }
+
+  async function cancelImport() {
+    if (!value) {
+      onChange(null);
+      return;
+    }
+    try {
+      await api.deleteTaskUpload(value.upload_id);
+    } catch {
+      /* 可能已被后台清理，忽略 */
+    }
+    onChange(null);
+  }
+
+  if (!value) {
+    return (
+      <div className="grid gap-2">
+        <Input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://github.com/owner/repo"
+          disabled={starting}
+          aria-label="GitHub 仓库地址"
+        />
+        <div className="flex gap-2">
+          <Input
+            value={ref}
+            onChange={(e) => setRef(e.target.value)}
+            placeholder="分支 / 标签 / commit（可选，默认分支）"
+            disabled={starting}
+            aria-label="分支或标签"
+            className="flex-1"
+          />
+          <Button type="button" onClick={() => void start(false)} disabled={starting}>
+            {starting ? <Loader2Icon className="animate-spin" /> : <GitBranchIcon />}
+            拉取源码
+          </Button>
+        </div>
+        {/* 体积确认：后端此时没有建行、没有下载，点「仍然继续」就是带 confirm_large 重发 */}
+        <AlertDialog open={pending !== null} onOpenChange={(o) => (!o ? setPending(null) : undefined)}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>源码包较大，是否继续？</AlertDialogTitle>
+              <AlertDialogDescription>
+                该仓库约 <b>{fmtBytes(pending?.estimated ?? 0)}</b>，超过默认上限 <b>{fmtBytes(pending?.limit ?? 0)}</b>
+                。
+                {pending?.exceedsHard
+                  ? "估算体积已超过硬上限，下载可能在达到上限时终止。"
+                  : "继续将下载完整源码包，解压后可能占用较多磁盘空间。"}
+                硬上限 {fmtBytes(pending?.hard ?? 0)}，超过会自动终止。
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>取消</AlertDialogCancel>
+              <AlertDialogAction onClick={() => void start(true, pending ?? undefined)}>仍然继续</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+    );
+  }
+
+  if (state === "failed") {
+    return (
+      <div className="border-destructive/40 bg-destructive/5 grid gap-2 rounded-lg border px-3 py-2">
+        <div className="flex items-center gap-2 text-sm">
+          <XIcon className="text-destructive size-4 shrink-0" />
+          <span className="font-medium">导入失败</span>
+        </div>
+        <p className="text-muted-foreground text-xs break-words">{value.error_message || "未知原因"}</p>
+        <div className="flex gap-2">
+          <Button type="button" size="sm" variant="outline" onClick={() => onChange(null)}>
+            重试
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (state === "awaiting_confirm") {
+    return (
+      <div className="grid gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+        <div className="text-sm font-medium">源码包超过默认上限，是否继续解压？</div>
+        <p className="text-muted-foreground text-xs">
+          已下载 {fmtBytes(value.downloaded_bytes ?? 0)}（源码包已保存在服务器，继续不会重新下载）。
+        </p>
+        <div className="flex gap-2">
+          <Button type="button" size="sm" onClick={() => void decide(true)}>
+            继续解压
+          </Button>
+          <Button type="button" size="sm" variant="outline" onClick={() => void decide(false)}>
+            取消
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (busy) {
+    return (
+      <div className="grid gap-2 rounded-lg border px-3 py-3">
+        <div className="flex items-center gap-2 text-sm">
+          <Loader2Icon className="text-muted-foreground size-4 shrink-0 animate-spin" />
+          {state === "extracting" ? "正在解压源码…" : "正在从 GitHub 拉取源码…"}
+          <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+            {state === "extracting" ? "" : `已下载 ${fmtBytes(value.downloaded_bytes ?? 0)}`}
+          </span>
+        </div>
+        <div className="bg-muted h-1.5 overflow-hidden rounded-full">
+          <div className="bg-primary/60 h-full w-1/3 animate-pulse rounded-full" />
+        </div>
+        <div>
+          <Button type="button" size="sm" variant="ghost" onClick={() => void cancelImport()}>
+            取消导入
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // ready
+  return (
+    <div className="bg-muted/40 flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2">
+      <GitBranchIcon className="text-muted-foreground size-4 shrink-0" />
+      <span className="min-w-0 flex-1 truncate text-sm font-medium" title={value.source_url ?? value.filename}>
+        {value.filename}
+      </span>
+      {/* 不再补一段短 commit：GitHub 来源的 filename 本身就是 `owner/repo@sha7`，
+          再拼一次会变成「repo@f32a86a · f32a86a」。 */}
+      <span className="text-muted-foreground text-xs whitespace-nowrap tabular-nums">
+        {value.file_count} 个文件 · {fmtBytes(value.total_bytes)}
+      </span>
+      <Button type="button" size="sm" variant="outline" onClick={() => void cancelImport()}>
+        重新选择
+      </Button>
+    </div>
+  );
+}
+
 function CreateTaskSheet({
   tasks,
   categories,
@@ -3296,19 +3545,48 @@ function CreateTaskSheet({
   const [sourceUploading, setSourceUploading] = React.useState(false);
   const [sourcePercent, setSourcePercent] = React.useState(0);
   const [sourceDragActive, setSourceDragActive] = React.useState(false);
+  // 源码来源：两种入口共用同一个 sourceUpload，创建任务的路径完全相同。
+  // 已选好源码时禁止切换（否则会留下一个没人消费的 staging 目录）。
+  const [sourceMode, setSourceMode] = React.useState<"upload" | "github">("upload");
   const sourceInputRef = React.useRef<HTMLInputElement>(null);
 
   // ---- 归属部门 / 当前账号权限 ----
   // 入口本身已由 TasksPage 按 permissions.can_create_task 收口，这里只需要账号身份
-  // （is_admin 决定部门可选范围与源码包是否必填）与 role=owner 的部门列表。
+  // （is_admin 决定部门可选范围）与 role=owner 的部门列表。源码对所有人都是必填。
   const { user } = useAuth();
   const [departments, setDepartments] = React.useState<Department[]>([]);
   const [departmentValue, setDepartmentValue] = React.useState<string>(DEPT_NONE_VALUE);
-  const departmentOptions = React.useMemo(
-    () => selectableDepartments(user, departments),
-    [user, departments],
-  );
+  const departmentOptions = React.useMemo(() => selectableDepartments(user, departments), [user, departments]);
   const isAdmin = Boolean(user?.is_admin);
+
+  // 抽屉重开时恢复「上次没用完的源码」。
+  //
+  // 没有这一步，用户误关抽屉（或刷新页面）后那次解压/下载会变成一条谁也看不见的
+  // staging 记录：磁盘一直占着，前端也再没有任何入口能消费它，只能等 24h 后由
+  // janitor 清掉。只恢复本人的、非 failed 的行 —— failed 没有任何东西可恢复，
+  // 留在卡片上只会挡住下一次导入。
+  const sourceRestored = React.useRef(false);
+  React.useEffect(() => {
+    if (sourceRestored.current || sourceUpload) return;
+    const meId = user?.id;
+    if (!meId) return;
+    sourceRestored.current = true;
+    api
+      .taskUploads()
+      .then((rows) => {
+        const mine = rows
+          .filter((u) => (u.created_by ?? meId) === meId && u.state !== "failed")
+          .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
+        const pick = mine[0];
+        if (!pick) return;
+        setSourceUpload(pick);
+        setSourceMode(pick.origin === "github" ? "github" : "upload");
+        toast.success(`已恢复上次未使用的源码：${pick.filename}`);
+      })
+      .catch(() => {
+        /* 恢复失败不该打扰用户：他本来只是想建一个新任务 */
+      });
+  }, [user?.id, sourceUpload]);
 
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
@@ -3399,9 +3677,15 @@ function CreateTaskSheet({
       toast.error("请填写描述与目标");
       return;
     }
-    // 源码包：后端对非管理员强制要求 upload_id；管理员可留空（先建任务后补代码）。
-    if (!isAdmin && !sourceUpload) {
-      toast.error("请先上传 .zip 源码包");
+    // 源码：所有账号都必须带 upload_id（后端同样强校验）。没有源码的任务读不到代码，
+    // 而且创建之后没有任何入口能补源码，所以这里提前拦下。
+    if (!sourceUpload) {
+      toast.error(sourceMode === "github" ? "请先导入 GitHub 仓库源码" : "请先上传 .zip 源码包");
+      return;
+    }
+    // 只有 ready 能被后端消费：awaiting_confirm 时后端会拒绝，提前拦下给出可读原因。
+    if (sourceUpload.state && sourceUpload.state !== "ready") {
+      toast.error(sourceUpload.state === "awaiting_confirm" ? "请先确认是否继续解压" : "源码还在准备中，请稍候");
       return;
     }
     // 归属部门：普通用户必须选一个自己拥有的部门；管理员可以「不指定」。
@@ -3483,15 +3767,17 @@ function CreateTaskSheet({
         <SheetHeader className="border-b p-6">
           <SheetTitle>新建任务</SheetTitle>
           <SheetDescription>
-            先上传 .zip 源码包，再填写审计对象与目标。任务创建后不会自动开始，需要到任务详情页点「开启任务」。
+            先提供源码（上传 .zip 或导入 GitHub
+            仓库），再填写审计对象与目标。任务创建后不会自动开始，需要到任务详情页点「开启任务」。
           </SheetDescription>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-6">
           <div className="grid gap-5">
-            {/* 第一步：源码包。上传→后端自动解压→拿 upload_id；创建任务时后端把源码搬进任务目录。 */}
+            {/* 第一步：源码。上传 zip 或填 GitHub 链接，两种方式产出同一个 upload_id；
+                创建任务时后端把源码搬进任务目录。 */}
             <Field>
-              <FieldLabel htmlFor="source-zip">源码包（.zip，必填）</FieldLabel>
+              <FieldLabel htmlFor="source-zip">源码（必填）</FieldLabel>
               <input
                 ref={sourceInputRef}
                 id="source-zip"
@@ -3500,75 +3786,105 @@ function CreateTaskSheet({
                 className="hidden"
                 onChange={(e) => void pickSourceZip(e.target.files?.[0])}
               />
-              {sourceUpload ? (
-                // ready：已解压，展示包信息 + 「重新上传」（换包时先删掉旧的 staging 目录）。
-                <div className="bg-muted/40 flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2">
-                  <FileArchiveIcon className="text-muted-foreground size-4 shrink-0" />
-                  <span className="min-w-0 flex-1 truncate text-sm font-medium" title={sourceUpload.filename}>
-                    {sourceUpload.filename}
-                  </span>
-                  <span className="text-muted-foreground text-xs whitespace-nowrap tabular-nums">
-                    {sourceUpload.file_count} 个文件 · {fmtBytes(sourceUpload.total_bytes)}
-                  </span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={sourceUploading}
-                    onClick={() => sourceInputRef.current?.click()}
-                  >
-                    {sourceUploading ? <Loader2Icon className="animate-spin" /> : <UploadIcon />}
-                    重新上传
-                  </Button>
-                </div>
-              ) : sourceUploading ? (
-                // uploading：XHR 进度（后端在收到完整包后才解压，所以这里只反映传输进度）。
-                <div className="grid gap-2 rounded-lg border px-3 py-3">
-                  <div className="flex items-center gap-2 text-sm">
-                    <Loader2Icon className="text-muted-foreground size-4 shrink-0 animate-spin" />
-                    正在上传源码包，后端将自动解压…
-                    <span className="ml-auto text-xs tabular-nums">{sourcePercent}%</span>
-                  </div>
-                  <Progress value={sourcePercent} />
-                </div>
-              ) : (
-                // idle：拖拽/点击选择。用原生拖放，避免为一个输入再引一个上传组件。
-                <div
-                  role="button"
-                  tabIndex={0}
-                  aria-label="选择或拖拽 .zip 源码包"
-                  onClick={() => sourceInputRef.current?.click()}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      sourceInputRef.current?.click();
-                    }
-                  }}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    setSourceDragActive(true);
-                  }}
-                  onDragLeave={() => setSourceDragActive(false)}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    setSourceDragActive(false);
-                    void pickSourceZip(e.dataTransfer?.files?.[0]);
-                  }}
-                  className={cn(
-                    "flex cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-dashed px-4 py-6 text-center transition-colors",
-                    "focus-visible:ring-ring focus-visible:ring-2 focus-visible:outline-none",
-                    sourceDragActive ? "border-primary bg-primary/5" : "hover:border-primary/60 hover:bg-muted/40",
+              {/* 来源切换复用项目自带的 Tabs：分段控件的边框、选中态与深色态不必另写一套。
+                  注意 Field 的 `*:w-full` 会把直接子元素拉满，所以宽度交给 TabsList 自己的
+                  w-fit，别在这里加 w-full。 */}
+              <Tabs
+                value={sourceMode}
+                onValueChange={(v) => setSourceMode(v === "github" ? "github" : "upload")}
+                className="gap-2"
+              >
+                <TabsList>
+                  {(["upload", "github"] as const).map((mode) => (
+                    <TabsTrigger
+                      key={mode}
+                      value={mode}
+                      // 已选好源码时不允许切换来源：否则会留下一个没人消费的 staging 目录。
+                      disabled={Boolean(sourceUpload) && sourceMode !== mode}
+                    >
+                      {mode === "upload" ? "上传 zip" : "GitHub 链接"}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+                <TabsContent value="upload" className="grid gap-2">
+                  {sourceUpload ? (
+                    // ready：已解压，展示包信息 + 「重新上传」（换包时先删掉旧的 staging 目录）。
+                    <div className="bg-muted/40 flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2">
+                      <FileArchiveIcon className="text-muted-foreground size-4 shrink-0" />
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium" title={sourceUpload.filename}>
+                        {sourceUpload.filename}
+                      </span>
+                      <span className="text-muted-foreground text-xs whitespace-nowrap tabular-nums">
+                        {sourceUpload.file_count} 个文件 · {fmtBytes(sourceUpload.total_bytes)}
+                      </span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={sourceUploading}
+                        onClick={() => sourceInputRef.current?.click()}
+                      >
+                        {sourceUploading ? <Loader2Icon className="animate-spin" /> : <UploadIcon />}
+                        重新上传
+                      </Button>
+                    </div>
+                  ) : sourceUploading ? (
+                    // uploading：XHR 进度（后端在收到完整包后才解压，所以这里只反映传输进度）。
+                    <div className="grid gap-2 rounded-lg border px-3 py-3">
+                      <div className="flex items-center gap-2 text-sm">
+                        <Loader2Icon className="text-muted-foreground size-4 shrink-0 animate-spin" />
+                        正在上传源码包，后端将自动解压…
+                        <span className="ml-auto text-xs tabular-nums">{sourcePercent}%</span>
+                      </div>
+                      <Progress value={sourcePercent} />
+                    </div>
+                  ) : (
+                    // idle：拖拽/点击选择。用原生拖放，避免为一个输入再引一个上传组件。
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      aria-label="选择或拖拽 .zip 源码包"
+                      onClick={() => sourceInputRef.current?.click()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          sourceInputRef.current?.click();
+                        }
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        setSourceDragActive(true);
+                      }}
+                      onDragLeave={() => setSourceDragActive(false)}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        setSourceDragActive(false);
+                        void pickSourceZip(e.dataTransfer?.files?.[0]);
+                      }}
+                      className={cn(
+                        "flex cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-dashed px-4 py-6 text-center transition-colors",
+                        "focus-visible:ring-ring focus-visible:ring-2 focus-visible:outline-none",
+                        sourceDragActive ? "border-primary bg-primary/5" : "hover:border-primary/60 hover:bg-muted/40",
+                      )}
+                    >
+                      <UploadIcon className="text-muted-foreground size-5" />
+                      <span className="text-sm">点击选择或拖拽 .zip 源码包到此处</span>
+                      <span className="text-muted-foreground text-xs">
+                        后端会自动解压；创建任务后由 Agent 按源码目录做审计
+                      </span>
+                    </div>
                   )}
-                >
-                  <UploadIcon className="text-muted-foreground size-5" />
-                  <span className="text-sm">点击选择或拖拽 .zip 源码包到此处</span>
-                  <span className="text-muted-foreground text-xs">
-                    后端会自动解压；创建任务后由 Agent 按源码目录做审计
-                  </span>
-                </div>
-              )}
+                </TabsContent>
+                <TabsContent value="github" className="grid gap-2">
+                  <GithubSourceBox value={sourceUpload} onChange={setSourceUpload} />
+                </TabsContent>
+              </Tabs>
+              {/* 两种来源各说一句，且只说一次：GitHub 的提示由这里统一给，
+                  GithubSourceBox 内部不再重复（否则同一段话会出现两遍）。 */}
               <FieldDescription>
-                源码包是创建任务的必填项（管理员可留空，先建任务后补源码）。上传后可重新上传替换。
+                {sourceMode === "github"
+                  ? "仅支持公开仓库。导入会固定到具体 commit，便于事后回溯；源码包不含 .git、submodule 与 Git LFS 实体。"
+                  : "源码包是创建任务的必填项。上传后自动解压，创建任务时由 Agent 按源码目录做审计。"}
               </FieldDescription>
             </Field>
             {/* 第二步：归属部门。管理员可「不指定」；普通用户必须选自己拥有的部门（后端强校验）。 */}

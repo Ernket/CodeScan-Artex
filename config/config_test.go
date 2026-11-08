@@ -40,3 +40,62 @@ func TestPostgresDSNPrecedence(t *testing.T) {
 		t.Fatalf("file dsn verbatim, got %q err %v", got, err)
 	}
 }
+
+// TestGitHubSettingsDefaultsAndEnv 覆盖导入限额的解析与「自愈」规则。
+//
+// 关键约束：配置写错不能把功能或进程带崩，只能被纠正。
+func TestGitHubSettingsDefaultsAndEnv(t *testing.T) {
+	t.Setenv("ARTEX_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
+	for _, k := range []string{"ARTEX_GITHUB_IMPORT", "ARTEX_GITHUB_MAX_MB", "ARTEX_GITHUB_HARD_MAX_MB",
+		"ARTEX_GITHUB_MAX_EXTRACT_MB", "ARTEX_GITHUB_TIMEOUT", "ARTEX_GITHUB_CONFIRM_TIMEOUT", "ARTEX_GITHUB_PROXY"} {
+		t.Setenv(k, "")
+	}
+
+	g := GitHubSettings()
+	if g.Disabled {
+		t.Error("默认应开启")
+	}
+	if g.MaxZipBytes != defaultGitHubMaxZipMB<<20 || g.HardMaxZipBytes != defaultGitHubHardMaxZipMB<<20 {
+		t.Errorf("默认限额不对: soft=%d hard=%d", g.MaxZipBytes, g.HardMaxZipBytes)
+	}
+	if g.MaxFiles != defaultGitHubMaxFiles || g.TimeoutSeconds != defaultGitHubTimeoutSeconds ||
+		g.ConfirmTimeoutSeconds != defaultGitHubConfirmSeconds {
+		t.Errorf("默认阈值不对: %+v", g)
+	}
+	if g.HardMaxZipBytes < g.MaxZipBytes || g.HardMaxExtractBytes < g.MaxExtractBytes {
+		t.Errorf("硬上限必须不小于软上限: %+v", g)
+	}
+
+	t.Setenv("ARTEX_GITHUB_MAX_MB", "8")
+	t.Setenv("ARTEX_GITHUB_MAX_EXTRACT_MB", "16")
+	t.Setenv("ARTEX_GITHUB_TIMEOUT", "90")
+	t.Setenv("ARTEX_GITHUB_CONFIRM_TIMEOUT", "30")
+	g = GitHubSettings()
+	if g.MaxZipBytes != 8<<20 || g.MaxExtractBytes != 16<<20 || g.TimeoutSeconds != 90 || g.ConfirmTimeoutSeconds != 30 {
+		t.Errorf("环境变量未生效: %+v", g)
+	}
+
+	// 硬上限小于软上限 → 抬到软上限，而不是报错或让闸门形同虚设。
+	t.Setenv("ARTEX_GITHUB_HARD_MAX_MB", "2")
+	if g = GitHubSettings(); g.HardMaxZipBytes != 8<<20 {
+		t.Errorf("硬上限应被抬到软上限，实得 %d", g.HardMaxZipBytes)
+	}
+
+	// 非法/零值视为未设置，回落到默认，不能变成「谁都导不进来」。
+	t.Setenv("ARTEX_GITHUB_MAX_MB", "0")
+	t.Setenv("ARTEX_GITHUB_MAX_MB", "abc")
+	if g = GitHubSettings(); g.MaxZipBytes != defaultGitHubMaxZipMB<<20 {
+		t.Errorf("非法值应回落默认，实得 %d", g.MaxZipBytes)
+	}
+
+	for _, v := range []string{"off", "0", "false", "OFF", "False"} {
+		t.Setenv("ARTEX_GITHUB_IMPORT", v)
+		if !GitHubSettings().Disabled {
+			t.Errorf("%q 应判定为关闭", v)
+		}
+	}
+	t.Setenv("ARTEX_GITHUB_IMPORT", "on")
+	if GitHubSettings().Disabled {
+		t.Error("on 不该判定为关闭")
+	}
+}

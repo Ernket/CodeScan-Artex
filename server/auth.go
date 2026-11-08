@@ -286,19 +286,29 @@ type taskAccess struct {
 //   - 部门成员：可读本部门任务；部门所有者（owner）可写，访客（visitor）只读；
 //   - 创建者：自己的任务（含无部门的历史任务）可读写。
 func (s *Server) taskAccessFor(u *db.User, t *Task) taskAccess {
-	if u == nil || t == nil {
+	if t == nil {
+		return taskAccess{}
+	}
+	return accessForOwner(u, t.DepartmentID, t.CreatedBy)
+}
+
+// accessForOwner 是任务权限判定的单一实现：入参只要归属信息（部门 + 创建者）。
+// 内存里的 Task、数据库里的 Task、以及只剩元数据的冷归档都能复用同一条规则，
+// 避免「按任务对象判」和「按归档反查判」两套口径漂移。
+func accessForOwner(u *db.User, departmentID, createdBy *int64) taskAccess {
+	if u == nil {
 		return taskAccess{}
 	}
 	if u.IsAdmin {
 		return taskAccess{View: true, Write: true}
 	}
 	acc := taskAccess{}
-	if t.CreatedBy != nil && *t.CreatedBy == u.ID {
+	if createdBy != nil && *createdBy == u.ID {
 		acc.View, acc.Write = true, true
 	}
-	if t.DepartmentID != nil {
+	if departmentID != nil {
 		for _, m := range u.Departments {
-			if m.DepartmentID == *t.DepartmentID {
+			if m.DepartmentID == *departmentID {
 				acc.View = true
 				if m.Role == db.DeptRoleOwner {
 					acc.Write = true

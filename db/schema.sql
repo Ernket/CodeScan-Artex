@@ -1520,6 +1520,29 @@ CREATE TABLE IF NOT EXISTS task_uploads (
 );
 CREATE INDEX IF NOT EXISTS idx_task_uploads_open ON task_uploads(created_at DESC) WHERE consumed_by IS NULL;
 
+-- GitHub 仓库导入：服务端代下 zipball，产物与本地 zip 上传完全一致（staging 目录 +
+-- upload_id），因此后续 createTask / attachUploadToTask / agent prompt 都不用改。
+-- origin: upload=用户上传 zip；github=服务端从 github.com 代下（见 docs/github-source-import.md）
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'upload';
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS source_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS resolved_commit TEXT NOT NULL DEFAULT '';
+-- fetching | awaiting_confirm | extracting | ready | failed。默认 ready 让存量行天然兼容。
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'ready';
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS downloaded_bytes BIGINT NOT NULL DEFAULT 0;
+-- 下载前由 API size 估算的字节数：只用于展示和审计，不作为限额依据。
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS declared_bytes BIGINT NOT NULL DEFAULT 0;
+-- 用户是否在弹窗里显式确认过「超过默认大小仍要继续」。
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS size_confirmed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE task_uploads ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+
+-- 一个账号同时只能有一个进行中的导入。用部分唯一索引做原子配额，不靠 count 查询。
+-- awaiting_confirm 必须算「进行中」，否则用户能在等确认时再起一个、绕过并发限制。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_uploads_active_import
+    ON task_uploads(created_by)
+    WHERE state IN ('fetching','awaiting_confirm','extracting');
+
 -- =====================================================================
 -- 第三方依赖（Java jar / .m2）——见 docs/java-m2依赖读取与反编译方案.md
 -- =====================================================================

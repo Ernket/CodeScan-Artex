@@ -25,10 +25,12 @@ import (
 // createDepsTask creates a task through the real HTTP API. The deps handlers look the
 // task up in the manager's in-memory registry, so going through the API (rather than
 // inserting a row) is what production does and the only thing the handlers can see.
-func createDepsTask(t *testing.T, h http.Handler, tok string) (string, int64) {
+func createDepsTask(t *testing.T, s *Server, h http.Handler, tok string) (string, int64) {
 	t.Helper()
 	cb, _ := json.Marshal(map[string]any{
 		"description": "本地仓库导入测试", "goal": "验证按坐标导入", "seedFirstIntent": false,
+		// 源码是建任务的必填项（所有账号一致），先造一个 ready 的 staging 上传。
+		"upload_id": stageTestSource(t, s, "depsimport"),
 	})
 	cr := httptest.NewRequest("POST", "/api/tasks", bytes.NewReader(cb))
 	cr.Header.Set("Authorization", "Bearer "+tok)
@@ -136,7 +138,7 @@ func TestDepsAPIImportFromLocalRepo(t *testing.T) {
 		makeJarForTest(t, "antlr", "antlr", "2.7.2"))
 	t.Setenv("ARTEX_JAVA_LOCAL_REPO", repoRoot)
 
-	tid, taskID := createDepsTask(t, h, tok)
+	tid, taskID := createDepsTask(t, s, h, tok)
 	defer pg.DeleteTask(taskID) //nolint:errcheck
 
 	// --- the capability is advertised before anything is imported ---
@@ -283,7 +285,7 @@ func TestDepsAPIImportScansSourcePoms(t *testing.T) {
 		makeJarForTest(t, "antlr", "antlr", "2.7.2"))
 	t.Setenv("ARTEX_JAVA_LOCAL_REPO", repoRoot)
 
-	tid, taskID := createDepsTask(t, h, tok)
+	tid, taskID := createDepsTask(t, s, h, tok)
 	defer pg.DeleteTask(taskID) //nolint:errcheck
 
 	// Stand up the source tree exactly the way an upload does: files under
@@ -359,7 +361,7 @@ func TestDepsAPIImportRequiresLocalRepo(t *testing.T) {
 	// Point at a path that does not exist: a typo must degrade to "disabled", not crash.
 	t.Setenv("ARTEX_JAVA_LOCAL_REPO", filepath.Join(t.TempDir(), "not-a-repo"))
 
-	tid, taskID := createDepsTask(t, h, tok)
+	tid, taskID := createDepsTask(t, s, h, tok)
 	defer pg.DeleteTask(taskID) //nolint:errcheck
 
 	before := getDepsList(t, h, tok, tid)

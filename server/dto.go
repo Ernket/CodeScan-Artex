@@ -67,7 +67,13 @@ type TaskDTO struct {
 	DepartmentName string `json:"department_name,omitempty"`
 	CreatedBy      *int64 `json:"created_by,omitempty"`
 	SourcePath     string `json:"source_path,omitempty"`
-	CanWrite       bool   `json:"can_write"` // 当前用户是否可写该任务（部门访客=false）
+	// 源码来源（仅 GitHub 导入时填充）。审计结论要能回溯到「哪次提交」，
+	// 这些字段从消费掉的那行 task_uploads 读出，不额外存一份。
+	SourceOrigin string `json:"source_origin,omitempty"`
+	SourceURL    string `json:"source_url,omitempty"`
+	SourceRef    string `json:"source_ref,omitempty"`
+	SourceCommit string `json:"source_commit,omitempty"`
+	CanWrite     bool   `json:"can_write"` // 当前用户是否可写该任务（部门访客=false）
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。

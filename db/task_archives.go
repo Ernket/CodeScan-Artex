@@ -175,6 +175,21 @@ func (d *DB) GetTaskArchive(id int64) (*TaskArchive, error) {
 	return item, err
 }
 
+// GetTaskArchiveFor 按账号可见范围取单个归档：不在范围内与不存在同样返回
+// nil（handler 统一 404，不暴露「存在但无权看」）。内部归档流程（worker、
+// 恢复/删除前的写权限反查）仍用 GetTaskArchive——它们自己会判权限。
+func (d *DB) GetTaskArchiveFor(id int64, scope TaskArchiveScope) (*TaskArchive, error) {
+	q := `SELECT ` + taskArchiveCols + ` FROM task_archives WHERE id=$1`
+	args := []any{id}
+	var extra string
+	extra, args = archiveScopeWhere(args, scope)
+	item, err := scanTaskArchive(d.QueryRow(q+extra, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return item, err
+}
+
 func (d *DB) GetTaskArchiveByTask(taskID int64) (*TaskArchive, error) {
 	item, err := scanTaskArchive(d.QueryRow(`SELECT `+taskArchiveCols+` FROM task_archives WHERE task_id=$1`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -183,7 +198,27 @@ func (d *DB) GetTaskArchiveByTask(taskID int64) (*TaskArchive, error) {
 	return item, err
 }
 
-func (d *DB) ListTaskArchives(search, state string, page, size int) (TaskArchivePage, error) {
+// TaskArchiveScope 是读取归档时的可见范围，语义与任务本身一致：
+// 管理员=全部；普通用户=所属部门下的任务归档 + 自己创建的任务归档。
+// 零值（All=false、无部门、UserID=0）什么都查不到——fail-closed，忘了传
+// scope 只会让列表变空，不会把别的部门归档放出去。
+type TaskArchiveScope struct {
+	All           bool
+	DepartmentIDs []int64
+	UserID        int64
+}
+
+// archiveScopeWhere 追加归档可见性条件；参数编号接在 args 之后。
+func archiveScopeWhere(args []any, scope TaskArchiveScope) (string, []any) {
+	if scope.All {
+		return "", args
+	}
+	args = append(args, scope.DepartmentIDs, scope.UserID)
+	return fmt.Sprintf(" AND task_id IN (SELECT id FROM tasks WHERE department_id = ANY($%d) OR created_by = $%d)",
+		len(args)-1, len(args)), args
+}
+
+func (d *DB) ListTaskArchives(search, state string, page, size int, scope TaskArchiveScope) (TaskArchivePage, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -194,13 +229,19 @@ func (d *DB) ListTaskArchives(search, state string, page, size int) (TaskArchive
 	state = strings.TrimSpace(state)
 	where := `WHERE ($1='' OR task_id::text ILIKE '%'||$1||'%' OR task_name ILIKE '%'||$1||'%' OR task_description ILIKE '%'||$1||'%')
 AND ($2='' OR state=$2)`
+	args := []any{search, state}
+	var scopeSQL string
+	scopeSQL, args = archiveScopeWhere(args, scope)
+	where += scopeSQL
 	var out TaskArchivePage
 	out.Page, out.Size = page, size
-	if err := d.QueryRow(`SELECT count(*) FROM task_archives `+where, search, state).Scan(&out.Total); err != nil {
+	if err := d.QueryRow(`SELECT count(*) FROM task_archives `+where, args...).Scan(&out.Total); err != nil {
 		return out, err
 	}
+	args = append(args, size, (page-1)*size)
 	rows, err := d.Query(`SELECT `+taskArchiveCols+` FROM task_archives `+where+`
-ORDER BY COALESCE(archived_at, requested_at) DESC, id DESC LIMIT $3 OFFSET $4`, search, state, size, (page-1)*size)
+ORDER BY COALESCE(archived_at, requested_at) DESC, id DESC
+LIMIT $`+strconv.Itoa(len(args)-1)+` OFFSET $`+strconv.Itoa(len(args)), args...)
 	if err != nil {
 		return out, err
 	}

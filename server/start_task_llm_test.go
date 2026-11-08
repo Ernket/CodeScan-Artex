@@ -52,7 +52,7 @@ func TestStartTaskWithoutLLMIsRejected(t *testing.T) {
 	}
 
 	// 造一个 created 任务并拿到它的 id（CreateTask 返回 string id）。
-	raw, _ := json.Marshal(map[string]string{"goal": "无 LLM 时开启任务"})
+	raw, _ := json.Marshal(map[string]string{"goal": "无 LLM 时开启任务", "upload_id": stageTestSource(t, s, "startllm")})
 	req := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(string(raw)))
 	req.Header.Set("Authorization", "Bearer "+testAdminToken(t, s))
 	req.Header.Set("Content-Type", "application/json")

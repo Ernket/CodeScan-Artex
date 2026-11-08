@@ -12,6 +12,7 @@ import {
   Building2Icon,
   CheckIcon,
   CircleAlertIcon,
+  GitBranchIcon,
   PauseIcon,
   PlayIcon,
   RocketIcon,
@@ -571,6 +572,22 @@ function TaskDetailInner() {
               <Building2Icon className="size-3" />
               {task.department_name}
             </span>
+          ) : null}
+          {/* 源码来源：放在标题下的元信息行，任务跑起来之后也一直可见。
+              之前只写在「未开启任务」引导卡里，一开启就消失了——而那正是用户想回溯
+              「这次审的是哪个 commit」的时刻。 */}
+          {task.source_origin === "github" && task.source_commit ? (
+            <a
+              href={task.source_url}
+              target="_blank"
+              rel="noreferrer"
+              className="bg-muted text-muted-foreground hover:text-foreground inline-flex max-w-80 shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs"
+              title={`源码来源：${task.source_url} @ ${task.source_commit}`}
+            >
+              <GitBranchIcon className="size-3 shrink-0" />
+              <span className="truncate">{(task.source_url ?? "").replace(/^https?:\/\/github\.com\//, "")}</span>
+              <code className="shrink-0 font-mono">{task.source_commit.slice(0, 7)}</code>
+            </a>
           ) : null}
         </div>
         {startError && (

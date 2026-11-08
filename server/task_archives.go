@@ -435,10 +435,30 @@ func validateArchivePath(dataDir, candidate string) error {
 	return nil
 }
 
+// archiveScopeFor 把账号折算成归档可见范围，规则与任务一致：
+// 管理员=全部；普通用户=所属部门下的归档 + 自己创建的任务归档。
+// 归档读接口不能用「登录即可」——归档里带任务名/描述/目标/统计，属于跨部门数据。
+func (s *Server) archiveScopeFor(u *pgdb.User) pgdb.TaskArchiveScope {
+	if u == nil {
+		return pgdb.TaskArchiveScope{}
+	}
+	if u.IsAdmin {
+		return pgdb.TaskArchiveScope{All: true}
+	}
+	deps, err := s.m.pg.Users().VisibleDepartmentIDs(u.ID, "")
+	if err != nil {
+		// 读部门失败时按「仅本人创建」收敛，宁可少给也不越权。
+		log.Printf("[archives] 读取账号 %d 的部门失败，按仅本人收敛: %v", u.ID, err)
+		deps = nil
+	}
+	return pgdb.TaskArchiveScope{DepartmentIDs: deps, UserID: u.ID}
+}
+
 func (s *Server) listTaskArchives(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-	result, err := s.m.pg.ListTaskArchives(r.URL.Query().Get("q"), r.URL.Query().Get("state"), page, size)
+	result, err := s.m.pg.ListTaskArchives(r.URL.Query().Get("q"), r.URL.Query().Get("state"), page, size,
+		s.archiveScopeFor(currentUser(r)))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -452,7 +472,7 @@ func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "归档 id 无效")
 		return
 	}
-	item, err := s.m.pg.GetTaskArchive(id)
+	item, err := s.m.pg.GetTaskArchiveFor(id, s.archiveScopeFor(currentUser(r)))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -486,8 +506,14 @@ func (s *Server) queueTaskArchive(w http.ResponseWriter, r *http.Request) {
 // 路径和请求体里都只有归档 id，没有任务 id，所以 guardTaskAccess 的路径正则覆盖不到，
 // 必须由归档记录反查任务再判权限——口径与 queueTaskArchivesBatch 的 requireBatchTaskWrite
 // 保持一致（部门访客只读，归档/恢复/删除都算修改任务）。
-// 任务不在内存里时非管理员一律拒绝：归档任务本就从 manager 卸载，拿不到它的部门与创建者
-// 就没有依据判权限，默认拒绝好过放行（与 guardTaskAccess 同款兜底）。
+//
+// 两步都用归档的可见范围收口：
+//  1. 归档本身用 GetTaskArchiveFor 取，跨部门与不存在同为 404——否则「存在但无权」
+//     返回 403 就变成了归档存在性探针；
+//  2. 归档任务早在归档完成时就从 manager 卸载（s.m.forgetTask），内存里查不到它，
+//     所以权限只能按数据库里的 department_id / created_by 判。此前这里在内存里
+//     找不到就一律 403，等于把「恢复自己的归档」也挡掉了；改成读库后，创建者与
+//     部门所有者能恢复/删除自己的归档，部门访客仍是 403。
 func (s *Server) requireArchiveTaskWrite(w http.ResponseWriter, r *http.Request, archiveID int64) bool {
 	u := currentUser(r)
 	if u == nil {
@@ -498,7 +524,7 @@ func (s *Server) requireArchiveTaskWrite(w http.ResponseWriter, r *http.Request,
 	if u.IsAdmin {
 		return true
 	}
-	archive, err := s.m.pg.GetTaskArchive(archiveID)
+	archive, err := s.m.pg.GetTaskArchiveFor(archiveID, s.archiveScopeFor(u))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return false
@@ -507,13 +533,23 @@ func (s *Server) requireArchiveTaskWrite(w http.ResponseWriter, r *http.Request,
 		writeErr(w, 404, "归档不存在")
 		return false
 	}
-	t, ok := s.m.Task(strconv.FormatInt(archive.TaskID, 10))
-	if !ok || t == nil {
-		writeErr(w, 403, "需要管理员权限")
+	task, err := s.m.pg.GetTask(archive.TaskID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
 		return false
 	}
-	if !s.taskWriteAllowed(u, t) {
-		writeErr(w, 403, "只读权限：部门访客不能修改或控制任务（任务 #"+t.ID+"）")
+	if task == nil {
+		// 任务已删除、只剩归档元数据的孤儿记录：对非管理员按不存在处理。
+		writeErr(w, 404, "归档不存在")
+		return false
+	}
+	access := accessForOwner(u, task.DepartmentID, task.CreatedBy)
+	if !access.View {
+		writeErr(w, 404, "归档不存在")
+		return false
+	}
+	if !access.Write {
+		writeErr(w, 403, "只读权限：部门访客不能修改或控制任务（任务 #"+strconv.FormatInt(task.ID, 10)+"）")
 		return false
 	}
 	return true

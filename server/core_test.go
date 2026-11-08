@@ -62,7 +62,10 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	}
 
 	// create a task → 201, returns PG task (string id + exploration_id)
-	code, out := doRetry("POST", "/api/tasks", map[string]string{"description": "smoke", "goal": "测试 SQLi/XSS"})
+	// 源码是所有账号的必填项，这里先造一个 ready 的 staging 上传。
+	code, out := doRetry("POST", "/api/tasks", map[string]string{
+		"description": "smoke", "goal": "测试 SQLi/XSS", "upload_id": stageTestSource(t, s, "core"),
+	})
 	if code != 201 {
 		t.Fatalf("create task: %d (%v)", code, out)
 	}

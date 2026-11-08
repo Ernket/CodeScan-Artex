@@ -2,6 +2,7 @@ package server
 
 import (
 	"archive/zip"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -12,10 +13,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 // =====================================================================
@@ -147,7 +149,17 @@ func (s *Server) uploadTaskSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	createdBy := me.ID
-	up, err := s.m.pg.TaskUploads().CreateTaskUpload(uploadID, savedName, zipPath, sourceDir, stats.Files, stats.Bytes, &createdBy)
+	up, err := s.m.pg.TaskUploads().CreateTaskUpload(db.NewTaskUpload{
+		ID:         uploadID,
+		Filename:   savedName,
+		StoredPath: zipPath,
+		SourcePath: sourceDir,
+		FileCount:  stats.Files,
+		TotalBytes: stats.Bytes,
+		CreatedBy:  &createdBy,
+		Origin:     "upload",
+		State:      db.UploadStateReady,
+	})
 	if err != nil {
 		cleanup()
 		writeErr(w, 500, "记录上传失败: "+err.Error())
@@ -162,6 +174,10 @@ func (s *Server) uploadTaskSource(w http.ResponseWriter, r *http.Request) {
 		"total_bytes": up.TotalBytes,
 		"entries":     stats.Entries,
 		"created_at":  up.CreatedAt,
+		// state 显式回传：前端用同一套「ready 才能建任务」的判断，
+		// 少一个分支就多一处误判。
+		"state":  up.State,
+		"origin": up.Origin,
 	})
 }
 
@@ -178,9 +194,17 @@ func (s *Server) listTaskUploads(w http.ResponseWriter, r *http.Request) {
 		if me != nil && !me.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != me.ID {
 			continue
 		}
+		// created_by 必须返回：抽屉恢复时要按归属过滤，否则管理员会把别人正在
+		// 下载的导入「接手」过来（恢复后建任务就会消费掉别人的 staging）。
+		// 其余字段是让恢复出来的行能直接渲染成对应的状态卡片（尤其 failed 的原因）。
 		out = append(out, map[string]any{
 			"upload_id": up.ID, "filename": up.Filename,
 			"file_count": up.FileCount, "total_bytes": up.TotalBytes, "created_at": up.CreatedAt,
+			"origin": up.Origin, "state": up.State, "source_url": up.SourceURL,
+			"source_ref": up.SourceRef, "resolved_commit": up.ResolvedCommit,
+			"downloaded_bytes": up.DownloadedBytes, "declared_bytes": up.DeclaredBytes,
+			"size_confirmed": up.SizeConfirmed, "error_message": up.ErrorMessage,
+			"created_by": up.CreatedBy,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"uploads": out})
@@ -207,6 +231,25 @@ func (s *Server) deleteTaskUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "该上传已被任务使用")
 		return
 	}
+	// 非终态的导入（fetching / awaiting_confirm / extracting）点删除 = 取消。
+	// 先让后台 goroutine 退出，再删行删目录：两边同时动手会留下「行没了目录还在」。
+	if up.State != db.UploadStateReady && up.State != db.UploadStateFailed {
+		if v, ok := s.importJobs.Load(id); ok {
+			job := v.(*githubImportJob)
+			job.cancelled.Store(true)
+			job.cancel()
+			select {
+			case <-job.done:
+			case <-time.After(5 * time.Second):
+				log.Printf("[github] %s 取消超时，强制清理", id)
+			}
+		}
+		// 兜底：goroutine 已退出时这里只是重复一次幂等操作；超时情形下由这里收尾。
+		_ = s.m.pg.TaskUploads().DeleteTaskUpload(id)
+		_ = os.RemoveAll(filepath.Join(s.m.dir, uploadDirName, id))
+		writeJSON(w, 200, map[string]any{"deleted": id})
+		return
+	}
 	if err := s.m.pg.TaskUploads().DeleteTaskUpload(id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -217,7 +260,11 @@ func (s *Server) deleteTaskUpload(w http.ResponseWriter, r *http.Request) {
 
 // attachUploadToTask moves one staging upload into the task's own directory and
 // records tasks.source_path. Called right after the task row is created.
-func (s *Server) attachUploadToTask(t *Task, uploadID string) error {
+//
+// caller 是发起建任务的账号；nil 表示受信的内部调用（不走 HTTP、没有身份）。
+// staging 是个人资源：查询/确认/删除三个接口都按 created_by 收敛，这里消费时
+// 如果漏掉同一道校验，知道 upload_id 的其它账号就能把别人的源码搬进自己的任务。
+func (s *Server) attachUploadToTask(caller *db.User, t *Task, uploadID string) error {
 	uploadID = strings.TrimSpace(uploadID)
 	if uploadID == "" || t == nil {
 		return nil
@@ -226,6 +273,24 @@ func (s *Server) attachUploadToTask(t *Task, uploadID string) error {
 	up, err := ups.GetTaskUpload(uploadID)
 	if err != nil {
 		return fmt.Errorf("上传不存在或已过期，请重新上传")
+	}
+	if caller != nil && !caller.IsAdmin && up.CreatedBy != nil && *up.CreatedBy != caller.ID {
+		return fmt.Errorf("无权使用他人的上传，请自己重新导入")
+	}
+	// 唯一的「源码是否就绪」闸门。前端不可信：用 fetching 中的 id 建任务，
+	// 搬过去的就是一个还不存在的目录。
+	switch up.State {
+	case db.UploadStateReady, "":
+		// ok
+	case db.UploadStateAwaitingConfirm:
+		return fmt.Errorf("源码包超过默认大小，请先在页面确认是否继续解压")
+	case db.UploadStateFailed:
+		if up.ErrorMessage != "" {
+			return fmt.Errorf("源码导入失败：%s", up.ErrorMessage)
+		}
+		return fmt.Errorf("源码导入失败，请重新导入")
+	default:
+		return fmt.Errorf("源码尚未就绪，请稍候再创建任务")
 	}
 	if up.ConsumedBy != nil {
 		return fmt.Errorf("该上传已被任务 #%d 使用", *up.ConsumedBy)
@@ -261,6 +326,13 @@ func (s *Server) attachUploadToTask(t *Task, uploadID string) error {
 	if !claimed {
 		return fmt.Errorf("该上传已被其他任务使用")
 	}
+	// 消费后清 staging：source/ 已经 rename 走，剩下的是原始 zip（本地上传时
+	// 会有几百 MB）。不清理的话 data/uploads 只增不减 —— 这是本次顺带修掉的
+	// 既有缺陷，GitHub 导入会把它放大。
+	stageDir := filepath.Join(s.m.dir, uploadDirName, uploadID)
+	if filepath.Clean(filepath.Dir(up.SourcePath)) == filepath.Clean(stageDir) {
+		_ = os.RemoveAll(stageDir)
+	}
 	log.Printf("[upload] %s → 任务 #%s 源码目录 %s", uploadID, t.ID, rel)
 	return nil
 }
@@ -272,34 +344,85 @@ type zipStats struct {
 	Entries []string
 }
 
-// extractZipArchive unpacks src into dest, refusing path traversal, symlinks and
-// over-large archives. Returns the file count/total size and the top-level entries.
+// errNotZip 表示内容不是有效 zip，或解压后没有任何文件。
+var errNotZip = errors.New("不是有效的 zip 归档")
+
+// 解压期的两种「限额拒绝」。必须是可识别的哨兵：GitHub 导入是异步的，
+// 失败文案只能通过 errors.Is 反推原因，否则用户只会看到「拉取失败，请稍后重试」，
+// 而他真正需要知道的是「这不是网络问题，是你这个包太大/文件太多」。
+var (
+	// 文案本身就是用户可见的最终文本（异步失败只能原样透出），所以哨兵也用中文。
+	errTooManyFiles    = errors.New("压缩包内文件数超过上限")
+	errTooLargeExtract = errors.New("解压后总大小超过上限")
+)
+
+// extractOptions 让同一次解压逻辑服务两种来源：本地上传（无包裹目录、固定限额）
+// 与 GitHub 导入（需要剥 {repo}- 前缀、限额可配、可取消）。
+type extractOptions struct {
+	// WrapperPrefix 非空时，若归档只有一个顶层目录且名字以它开头，则剥掉这层。
+	WrapperPrefix string
+	MaxBytes      int64
+	MaxFiles      int
+	Context       context.Context
+}
+
+// extractZipArchive unpacks src into dest with the upload path's defaults.
 func extractZipArchive(src, dest string) (zipStats, error) {
+	return extractZipArchiveOpts(src, dest, extractOptions{
+		MaxBytes: maxExtractBytes,
+		MaxFiles: maxExtractFiles,
+	})
+}
+
+// extractZipArchiveOpts unpacks src into dest, refusing path traversal, symlinks
+// and over-large archives. Returns the file count/total size and the top-level
+// entries of the final destination.
+func extractZipArchiveOpts(src, dest string, opt extractOptions) (zipStats, error) {
 	var stats zipStats
+	maxBytes := opt.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = maxExtractBytes
+	}
+	maxFiles := opt.MaxFiles
+	if maxFiles <= 0 {
+		maxFiles = maxExtractFiles
+	}
+	ctx := opt.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	zr, err := zip.OpenReader(src)
 	if err != nil {
-		return stats, fmt.Errorf("不是合法的 zip 文件（%v）", err)
+		return stats, fmt.Errorf("%w：文件不是合法的 zip（%v）", errNotZip, err)
 	}
 	defer zr.Close()
-	if len(zr.File) > maxExtractFiles {
-		return stats, fmt.Errorf("压缩包内文件数超过 %d", maxExtractFiles)
+	if len(zr.File) > maxFiles {
+		return stats, fmt.Errorf("%w（%d 个）", errTooManyFiles, maxFiles)
 	}
-	if err := os.MkdirAll(dest, 0o755); err != nil {
+
+	// 先解到同级 raw/ 再整体改名：剥包裹目录只需要一次 rename，不必逐文件判断。
+	raw := dest + ".raw"
+	if err := os.RemoveAll(raw); err != nil {
 		return stats, err
 	}
-	topLevel := map[string]bool{}
-	for _, f := range zr.File {
+	if err := os.MkdirAll(raw, 0o755); err != nil {
+		return stats, err
+	}
+	cleanupRaw := func() { _ = os.RemoveAll(raw) }
+
+	for i, f := range zr.File {
+		if i%200 == 0 && ctx.Err() != nil {
+			cleanupRaw()
+			return stats, ctx.Err()
+		}
 		rel, ok := safeZipPath(f.Name)
 		if !ok || rel == "" {
 			continue
 		}
-		if i := strings.IndexByte(rel, '/'); i > 0 {
-			topLevel[rel[:i]] = true
-		} else if rel != "" {
-			topLevel[rel] = true
-		}
 		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(filepath.Join(dest, filepath.FromSlash(rel)), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Join(raw, filepath.FromSlash(rel)), 0o755); err != nil {
+				cleanupRaw()
 				return stats, err
 			}
 			continue
@@ -308,48 +431,65 @@ func extractZipArchive(src, dest string) (zipStats, error) {
 		if f.Mode()&os.ModeSymlink != 0 || f.Mode()&os.ModeDevice != 0 || f.Mode()&os.ModeNamedPipe != 0 {
 			continue
 		}
-		target := filepath.Join(dest, filepath.FromSlash(rel))
+		target := filepath.Join(raw, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			cleanupRaw()
 			return stats, err
 		}
-		if stats.Bytes+int64(f.UncompressedSize64) > maxExtractBytes {
-			return stats, fmt.Errorf("解压后总大小超过上限（%d GiB）", maxExtractBytes>>30)
+		if stats.Bytes+int64(f.UncompressedSize64) > maxBytes {
+			cleanupRaw()
+			return stats, fmt.Errorf("%w（%d MiB）", errTooLargeExtract, maxBytes>>20)
 		}
 		rc, err := f.Open()
 		if err != nil {
+			cleanupRaw()
 			return stats, err
 		}
 		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			_ = rc.Close()
+			cleanupRaw()
 			return stats, err
 		}
-		n, err := io.Copy(out, io.LimitReader(rc, maxExtractBytes))
+		n, err := io.Copy(out, io.LimitReader(rc, maxBytes))
 		_ = rc.Close()
 		closeErr := out.Close()
 		if err != nil {
+			cleanupRaw()
 			return stats, err
 		}
 		if closeErr != nil {
+			cleanupRaw()
 			return stats, closeErr
 		}
 		stats.Files++
 		stats.Bytes += n
-		if stats.Files > maxExtractFiles {
-			return stats, fmt.Errorf("压缩包内文件数超过 %d", maxExtractFiles)
+		if stats.Files > int64(maxFiles) {
+			cleanupRaw()
+			return stats, fmt.Errorf("%w（%d 个）", errTooManyFiles, maxFiles)
 		}
 	}
-	if len(topLevel) > 0 {
-		entries := make([]string, 0, len(topLevel))
-		for name := range topLevel {
-			entries = append(entries, name)
+
+	// 剥 GitHub 的包裹目录。判定必须用 {repo}- 前缀，不能只看「只有一个顶层目录」：
+	// 一个把所有代码放在 src/ 下的仓库也只有一个顶层目录，剥掉就把仓库结构改错了。
+	final := raw
+	if opt.WrapperPrefix != "" {
+		if ents, err := os.ReadDir(raw); err == nil && len(ents) == 1 && ents[0].IsDir() &&
+			strings.HasPrefix(ents[0].Name(), opt.WrapperPrefix) {
+			final = filepath.Join(raw, ents[0].Name())
 		}
-		sort.Strings(entries)
-		if len(entries) > 20 {
-			entries = entries[:20]
-		}
-		stats.Entries = entries
 	}
+	if err := os.RemoveAll(dest); err != nil {
+		cleanupRaw()
+		return stats, err
+	}
+	if err := os.Rename(final, dest); err != nil {
+		cleanupRaw()
+		return stats, err
+	}
+	cleanupRaw() // 剥根后 raw 里可能还剩空壳目录
+
+	stats.Entries = topLevelEntries(dest)
 	return stats, nil
 }
 
