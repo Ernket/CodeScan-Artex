@@ -21,6 +21,12 @@
   "_comment_skill_dir": "skill 根目录（每个子目录一个 skill，含 SKILL.md）。优先级：环境变量 ARTEX_SKILL_DIR > 本字段 > 默认（可执行文件同级的 skills/）。留空或删除本字段即用默认。相对路径相对当前工作目录解析。",
   "skill_dir": "/opt/artex/skills",
 
+  "_comment_github_import": "仓库导入（可选）。extra_hosts 用来接入自建 GitLab / GitHub Enterprise：只填主机名或 IP 即可，协议、端口、路径会被忽略；平台会自动探测（先 GitLab，再 GitHub Enterprise）。注意 API 需使用标准路径（GitLab /api/v4、GHES /api/v3），子路径部署暂不支持；若归档下载会跳转到独立的对象存储域名，也要把该域名加进来。allow_private_network 默认 true，允许访问内网地址；云元数据地址（169.254/16、fe80::/10）始终拦截。也可用环境变量 ARTEX_GITHUB_EXTRA_HOSTS（逗号分隔）与 ARTEX_GITHUB_ALLOW_PRIVATE_NETWORK。",
+  "github_import": {
+    "extra_hosts": ["gitlab.example.internal", "192.168.1.50"],
+    "allow_private_network": true
+  },
+
   "_comment_java": "Java 依赖反编译（可选）。java.local_repo 指向服务器本机的 Maven 仓库目录（就是 ~/.m2/repository）。配上之后【所有任务】都能在依赖页按坐标把 jar 拉进来，不用再上传依赖包；平台只读该目录，绝不修改它，也绝不遍历它——只会去被点名坐标对应的那一条路径上取件。优先级：环境变量 ARTEX_JAVA_LOCAL_REPO > 本字段 > 默认（空 = 关闭该功能）。路径不存在或不可读时该功能自动关闭，其余功能不受影响。",
   "java": {
     "local_repo": "/root/.m2/repository"

@@ -80,6 +80,23 @@ type GitHubImport struct {
 	// Proxy is an explicit proxy for GitHub traffic, empty = direct. The platform
 	// global proxy is deliberately not reused: it carries offensive traffic.
 	Proxy string `json:"proxy"`
+	// ExtraHosts allows self-hosted code hosts (GitLab or GitHub Enterprise) in
+	// addition to github.com / gitlab.com. Each entry is a hostname or IP literal;
+	// scheme, port and path are ignored. Declaring a host is the whole setup: the
+	// platform is probed automatically (GitLab first, then GitHub Enterprise).
+	ExtraHosts []string `json:"extra_hosts"`
+	// AllowPrivateNetwork lets imports dial private / loopback addresses, which is
+	// what intranet hosts need. nil means true; cloud metadata addresses
+	// (169.254.0.0/16, fe80::/10) are blocked either way.
+	AllowPrivateNetwork *bool `json:"allow_private_network"`
+}
+
+// PrivateNetworkAllowed reports whether imports may dial private / loopback IPs.
+func (g GitHubImport) PrivateNetworkAllowed() bool {
+	if g.AllowPrivateNetwork == nil {
+		return true
+	}
+	return *g.AllowPrivateNetwork
 }
 
 // Config is the on-disk config file shape.
@@ -105,7 +122,8 @@ const (
 //
 //	env (ARTEX_GITHUB_IMPORT / ARTEX_GITHUB_MAX_MB / ARTEX_GITHUB_HARD_MAX_MB /
 //	     ARTEX_GITHUB_MAX_EXTRACT_MB / ARTEX_GITHUB_TIMEOUT /
-//	     ARTEX_GITHUB_CONFIRM_TIMEOUT / ARTEX_GITHUB_PROXY)
+//	     ARTEX_GITHUB_CONFIRM_TIMEOUT / ARTEX_GITHUB_PROXY /
+//	     ARTEX_GITHUB_EXTRA_HOSTS / ARTEX_GITHUB_ALLOW_PRIVATE_NETWORK)
 //	  >  config file (github_import.*)
 //	  >  defaults
 //
@@ -144,6 +162,17 @@ func GitHubSettings() GitHubImport {
 	}
 	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_PROXY")); v != "" {
 		g.Proxy = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_EXTRA_HOSTS")); v != "" {
+		for _, h := range strings.Split(v, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				g.ExtraHosts = append(g.ExtraHosts, h)
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_GITHUB_ALLOW_PRIVATE_NETWORK")); v != "" {
+		b := !(v == "0" || strings.EqualFold(v, "off") || strings.EqualFold(v, "false"))
+		g.AllowPrivateNetwork = &b
 	}
 
 	if g.MaxZipBytes <= 0 {

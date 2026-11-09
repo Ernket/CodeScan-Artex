@@ -10,6 +10,7 @@ package githubsrc
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -30,6 +31,8 @@ var (
 	// 实测：DMCA 下架的仓库对 /repos/{o}/{r} 返回 451，而不是 404 —— 它确实存在，
 	// 只是拒绝提供内容，所以文案必须和「仓库不存在」区分开。
 	ErrRepoBlocked = errors.New("repo blocked")
+	// ErrPlatformUnknown 表示自定义 host 既不像 GitLab 也不像 GitHub Enterprise。
+	ErrPlatformUnknown = errors.New("platform unknown")
 )
 
 // Provider identifies the code host a Spec points at. The zero value is GitHub:
@@ -40,6 +43,9 @@ type Provider string
 const (
 	ProviderGitHub Provider = "github"
 	ProviderGitLab Provider = "gitlab"
+	// ProviderAuto marks a host declared in extra_hosts. Its platform is unknown
+	// until the client probes the API (GitLab first, then GitHub Enterprise).
+	ProviderAuto Provider = "auto"
 )
 
 // Spec is a parsed repository reference. Path is the full project path
@@ -49,6 +55,9 @@ type Spec struct {
 	Provider Provider
 	Path     string
 	Ref      string
+	// Origin is scheme://host[:port] for hosts declared in extra_hosts. It is
+	// empty for the built-in github.com / gitlab.com, whose bases are constants.
+	Origin string
 }
 
 func (s Spec) String() string { return s.Path }
@@ -71,15 +80,18 @@ func (s Spec) Repo() string {
 }
 
 func (s Spec) provider() Provider {
-	if s.Provider == ProviderGitLab {
-		return ProviderGitLab
+	if s.Provider == "" {
+		return ProviderGitHub
 	}
-	return ProviderGitHub
+	return s.Provider
 }
 
 // WebURL is the canonical browser URL of the repository, used for the task's
 // source_url (so the UI links back to the right host).
 func (s Spec) WebURL() string {
+	if s.Origin != "" {
+		return s.Origin + "/" + s.Path
+	}
 	host := "github.com"
 	if s.provider() == ProviderGitLab {
 		host = "gitlab.com"
@@ -87,18 +99,27 @@ func (s Spec) WebURL() string {
 	return "https://" + host + "/" + s.Path
 }
 
-// ParseRepoURL accepts the URL shapes users actually paste:
+// ParseRepoURL accepts the URL shapes users actually paste for the built-in
+// github.com / gitlab.com hosts. See ParseRepoURLWithHosts for custom hosts.
+func ParseRepoURL(raw string) (Spec, error) {
+	return ParseRepoURLWithHosts(raw, nil)
+}
+
+// ParseRepoURLWithHosts accepts the built-in URL shapes plus any host declared
+// in extraHosts:
 //
 //	https://github.com/{owner}/{repo}[.git][/]
 //	https://github.com/{owner}/{repo}/tree/{ref}          (ref may contain "/")
 //	https://gitlab.com/{group}[/{subgroup}...]/{project}[.git][/]
 //	https://gitlab.com/{group}/.../{project}/-/tree/{ref}
+//	http(s)://{extraHost}[:port]/{group}/.../{project}[/-/tree/{ref}]
+//	http(s)://{extraHost}[:port]/{owner}/{repo}[/tree/{ref}]
 //
-// Everything else is rejected: non-https schemes, hosts that merely contain
-// "github.com", userinfo, ports, query strings, fragments, and dot segments.
-// Rejecting is deliberate — a permissive parser would hand the rest of this
-// package an attacker-chosen host.
-func ParseRepoURL(raw string) (Spec, error) {
+// Everything else is rejected: unsupported schemes, hosts that merely contain
+// "github.com", userinfo, query strings, fragments, and dot segments. Rejecting
+// is deliberate — a permissive parser would hand the rest of this package an
+// attacker-chosen host.
+func ParseRepoURLWithHosts(raw string, extraHosts []string) (Spec, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return Spec{}, ErrInvalidURL
@@ -107,36 +128,168 @@ func ParseRepoURL(raw string) (Spec, error) {
 	if err != nil || u.Opaque != "" {
 		return Spec{}, ErrInvalidURL
 	}
-	if !strings.EqualFold(u.Scheme, "https") {
-		return Spec{}, fmt.Errorf("%w: 只支持 https 地址", ErrInvalidURL)
-	}
 	if u.User != nil {
 		return Spec{}, fmt.Errorf("%w: 地址不能包含用户名或凭据", ErrInvalidURL)
-	}
-	if u.Port() != "" {
-		return Spec{}, fmt.Errorf("%w: 地址不能带端口", ErrInvalidURL)
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
 		return Spec{}, fmt.Errorf("%w: 地址不能带查询参数或锚点", ErrInvalidURL)
 	}
 	// Hostname() 会去掉端口并做小写归一；用它比对而不是 Contains，否则
 	// github.com.evil.com 会被当成合法主机。
-	provider := Provider("")
-	switch strings.ToLower(u.Hostname()) {
+	host := strings.ToLower(u.Hostname())
+	scheme := strings.ToLower(u.Scheme)
+
+	switch host {
 	case "github.com", "www.github.com":
-		provider = ProviderGitHub
+		if err := checkPublicURL(u); err != nil {
+			return Spec{}, err
+		}
+		return parseGitHubPath(splitPath(u.Path))
 	case "gitlab.com", "www.gitlab.com":
-		provider = ProviderGitLab
-	default:
-		return Spec{}, fmt.Errorf("%w: 只支持 github.com 或 gitlab.com 的仓库", ErrInvalidURL)
+		if err := checkPublicURL(u); err != nil {
+			return Spec{}, err
+		}
+		return parseGitLabPath(splitPath(u.Path))
 	}
 
-	// u.Path 已解码，所以 %2e%2e 会还原成 ".."，直接在段上判断即可。
-	segs := splitPath(u.Path)
-	if provider == ProviderGitLab {
-		return parseGitLabPath(segs)
+	if !hostAllowed(host, extraHosts) {
+		return Spec{}, fmt.Errorf("%w: 只支持 github.com / gitlab.com，或配置 github_import.extra_hosts 中列出的地址", ErrInvalidURL)
 	}
-	return parseGitHubPath(segs)
+	if scheme != "https" && scheme != "http" {
+		return Spec{}, fmt.Errorf("%w: 只支持 http/https 地址", ErrInvalidURL)
+	}
+	origin := scheme + "://" + strings.ToLower(u.Host)
+	return parseCustomPath(splitPath(u.Path), origin)
+}
+
+// checkPublicURL keeps the built-in hosts on the original strict shape: https
+// only, standard port only.
+func checkPublicURL(u *url.URL) error {
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("%w: 只支持 https 地址", ErrInvalidURL)
+	}
+	if u.Port() != "" {
+		return fmt.Errorf("%w: 地址不能带端口", ErrInvalidURL)
+	}
+	return nil
+}
+
+// parseCustomPath handles a host from extra_hosts. The URL shape decides what we
+// can know without a network probe:
+//   - "/-/tree/{ref}" is GitLab-only, so the platform is known.
+//   - "/owner/repo/tree/{ref}" only tells us where the path ends and ref starts;
+//     the platform stays ProviderAuto because GitLab legacy links look the same.
+//   - anything else stays ProviderAuto and the client probes the API.
+func parseCustomPath(segs []string, origin string) (Spec, error) {
+	if len(segs) < 2 {
+		return Spec{}, fmt.Errorf("%w: 地址应形如 {host}/group/project 或 {host}/owner/repo", ErrInvalidURL)
+	}
+	project := segs
+	ref := ""
+	provider := ProviderAuto
+
+	for i, s := range segs {
+		if s != "-" {
+			continue
+		}
+		project = segs[:i]
+		tail := segs[i+1:]
+		if len(tail) == 0 || tail[0] != "tree" {
+			return Spec{}, fmt.Errorf("%w: 仅支持仓库根地址或 /-/tree/{分支}", ErrInvalidURL)
+		}
+		if len(tail) < 2 {
+			return Spec{}, fmt.Errorf("%w: /-/tree/ 后缺少分支名", ErrInvalidURL)
+		}
+		r, err := joinRef(tail[1:])
+		if err != nil {
+			return Spec{}, err
+		}
+		ref, provider = r, ProviderGitLab
+		break
+	}
+
+	// GitHub Enterprise 的网页形态 /owner/repo/tree/{ref}：只切出 project 与
+	// ref，平台仍交给探测决定。GitLab 的旧链接也可能长这样（网页会 302 到
+	// /-/tree/），直接判成 GHES 会把这类地址误拒。
+	if provider == ProviderAuto && len(segs) >= 4 && segs[2] == "tree" {
+		r, err := joinRef(segs[3:])
+		if err != nil {
+			return Spec{}, err
+		}
+		project, ref = segs[:2], r
+	} else if provider == ProviderAuto && len(segs) == 3 && segs[2] == "tree" {
+		return Spec{}, fmt.Errorf("%w: /tree/ 后缺少分支名", ErrInvalidURL)
+	}
+
+	if len(project) < 2 {
+		return Spec{}, fmt.Errorf("%w: 地址应形如 {host}/group/project 或 {host}/owner/repo", ErrInvalidURL)
+	}
+	if len(project) > 20 {
+		return Spec{}, fmt.Errorf("%w: 项目路径层级过深", ErrInvalidURL)
+	}
+	clean := make([]string, len(project))
+	for i, s := range project {
+		if err := validName(s, "项目路径"); err != nil {
+			return Spec{}, err
+		}
+		clean[i] = s
+	}
+	clean[len(clean)-1] = strings.TrimSuffix(clean[len(clean)-1], ".git")
+	if err := validName(clean[len(clean)-1], "repo"); err != nil {
+		return Spec{}, err
+	}
+	path := strings.Join(clean, "/")
+	if len(path) > 200 {
+		return Spec{}, fmt.Errorf("%w: 项目路径过长", ErrInvalidURL)
+	}
+	return Spec{Provider: provider, Path: path, Ref: ref, Origin: origin}, nil
+}
+
+// NormalizeHosts turns config entries into lowercased hostnames. Entries may be
+// "host", "host:port", "192.168.1.50" or a full URL; scheme, port and path are
+// ignored because declared hosts are trusted on any port and either scheme.
+func NormalizeHosts(list []string) []string {
+	out := make([]string, 0, len(list))
+	seen := map[string]bool{}
+	for _, raw := range list {
+		h := normalizeHost(raw)
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	return out
+}
+
+func normalizeHost(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if !strings.Contains(s, "://") {
+		// 裸 IPv6 字面量必须先加方括号，否则 url.Parse("https://::1") 直接失败，
+		// 配置项会被静默丢弃。
+		if ip := net.ParseIP(s); ip != nil && ip.To4() == nil && !strings.HasPrefix(s, "[") {
+			s = "https://[" + s + "]"
+		} else {
+			s = "https://" + s
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+func hostAllowed(host string, extraHosts []string) bool {
+	for _, raw := range extraHosts {
+		if normalizeHost(raw) == host {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGitHubPath(segs []string) (Spec, error) {

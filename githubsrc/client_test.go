@@ -264,3 +264,207 @@ func TestGitLabRepoCommitArchive(t *testing.T) {
 		t.Errorf("归档地址不对: %s", archiveURI)
 	}
 }
+
+// TestResolveProviderPrefersGitLab 盯住自定义 host 的探测顺序：GitLab 先于
+// GitHub Enterprise，且命中后按 origin 缓存，不会每次导入都重复探测。
+func TestResolveProviderPrefersGitLab(t *testing.T) {
+	var glHits, ghHits int32
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v4/projects/"):
+			atomic.AddInt32(&glHits, 1)
+			_, _ = io.WriteString(w, `{"path":"r","name":"R"}`)
+		case strings.HasPrefix(r.URL.Path, "/api/v3/repos/"):
+			atomic.AddInt32(&ghHits, 1)
+			_, _ = io.WriteString(w, `{"name":"R","size":1}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	c.setExtraHosts([]string{"127.0.0.1"})
+	c.allowPrivateNetwork = true
+
+	sp := Spec{Provider: ProviderAuto, Path: "o/r", Origin: srv.URL}
+	got, err := c.ResolveProvider(context.Background(), sp)
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got.Provider != ProviderGitLab || got.Origin != srv.URL {
+		t.Errorf("应识别为 GitLab 并保留 origin，得到 %+v", got)
+	}
+	if glHits != 1 || ghHits != 0 {
+		t.Errorf("应先探测 GitLab 且不碰 GHES，实际 gl=%d gh=%d", glHits, ghHits)
+	}
+
+	// 第二次：平台缓存 + 元数据缓存，都不应再打上游。
+	if _, err := c.ResolveProvider(context.Background(), sp); err != nil {
+		t.Fatalf("ResolveProvider 二次: %v", err)
+	}
+	if glHits != 1 || ghHits != 0 {
+		t.Errorf("缓存失效，实际 gl=%d gh=%d", glHits, ghHits)
+	}
+}
+
+// TestResolveProviderFallsBackToGitHubEnterprise 盯住 GitLab 探测失败后的降级，
+// 以及 GHES 的 /api/v3 + /zipball 模板。
+func TestResolveProviderFallsBackToGitHubEnterprise(t *testing.T) {
+	const sha = "87e8c32b8918a836c09475e0f668ea7c436d3758"
+	payload := []byte("PK\x03\x04ghes-zip")
+	var metaHits int32
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v4/"):
+			http.NotFound(w, r)
+		case r.URL.Path == "/api/v3/repos/o/r":
+			atomic.AddInt32(&metaHits, 1)
+			_, _ = io.WriteString(w, `{"name":"r","size":2}`)
+		case strings.HasPrefix(r.URL.Path, "/api/v3/repos/o/r/commits/"):
+			_, _ = io.WriteString(w, `{"sha":"`+strings.ToUpper(sha)+`"}`)
+		case strings.HasPrefix(r.URL.Path, "/api/v3/repos/o/r/zipball/"):
+			_, _ = w.Write(payload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	c.setExtraHosts([]string{"127.0.0.1"})
+	c.allowPrivateNetwork = true
+
+	sp := Spec{Provider: ProviderAuto, Path: "o/r", Origin: srv.URL}
+	got, err := c.ResolveProvider(context.Background(), sp)
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got.Provider != ProviderGitHub {
+		t.Fatalf("应降级为 GitHub Enterprise，得到 %+v", got)
+	}
+	if _, err := c.Repo(context.Background(), got); err != nil {
+		t.Fatalf("Repo: %v", err)
+	}
+	if metaHits != 1 {
+		t.Errorf("探测结果应被元数据缓存复用，实际请求 %d 次", metaHits)
+	}
+	commit, err := c.ResolveCommit(context.Background(), got)
+	if err != nil || commit != sha {
+		t.Fatalf("ResolveCommit = %q, %v", commit, err)
+	}
+	rc, _, err := c.OpenArchive(context.Background(), got, commit)
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer rc.Close()
+	body, _ := io.ReadAll(rc)
+	if string(body) != string(payload) {
+		t.Errorf("归档内容不一致: %q", body)
+	}
+}
+
+func TestResolveProviderUnknownPlatform(t *testing.T) {
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	sp := Spec{Provider: ProviderAuto, Path: "o/r", Origin: srv.URL}
+	if _, err := c.ResolveProvider(context.Background(), sp); !errors.Is(err, ErrPlatformUnknown) {
+		t.Fatalf("期望 ErrPlatformUnknown，得到 %v", err)
+	}
+}
+
+// TestResolveProviderDeepPathIsGitLab 盯住「多级路径只可能是 GitLab」这一捷径，
+// 避免为自建 GitLab 多打一次探测请求。
+func TestResolveProviderDeepPathIsGitLab(t *testing.T) {
+	var hits int32
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = io.WriteString(w, `{"path":"project","name":"P"}`)
+	}))
+	sp := Spec{Provider: ProviderAuto, Path: "group/sub/project", Origin: srv.URL}
+	got, err := c.ResolveProvider(context.Background(), sp)
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got.Provider != ProviderGitLab {
+		t.Errorf("三段的路径应直接判定为 GitLab，得到 %+v", got)
+	}
+	if hits != 0 {
+		t.Errorf("不应发起探测请求，实际 %d 次", hits)
+	}
+}
+
+func TestCheckURLExtraHostsAllowHTTPAndAnyPort(t *testing.T) {
+	c := newClient("", defaultAPIBase, defaultCodeloadBase, defaultGitLabAPIBase, false, false)
+	c.setExtraHosts([]string{"gitlab.corp.local", "192.168.1.50"})
+
+	ok := []string{
+		"http://gitlab.corp.local:8080/api/v4/projects/g%2Fp",
+		"https://gitlab.corp.local/x",
+		"http://192.168.1.50:3000/o/r",
+	}
+	for _, raw := range ok {
+		u, _ := url.Parse(raw)
+		if err := c.checkURL(u); err != nil {
+			t.Errorf("%s 应当放行: %v", raw, err)
+		}
+	}
+	for _, raw := range []string{"http://other.corp.local/x", "http://github.com/o/r"} {
+		u, _ := url.Parse(raw)
+		if err := c.checkURL(u); err == nil {
+			t.Errorf("%s 应当被拒绝", raw)
+		}
+	}
+}
+
+// TestDialControlAllowPrivateNetwork 盯住「放行内网但仍拦元数据」这条边界。
+func TestDialControlAllowPrivateNetwork(t *testing.T) {
+	c := &Client{allowPrivateNetwork: true}
+	for _, addr := range []string{"10.0.0.5:443", "192.168.1.50:8080", "127.0.0.1:3000", "[::1]:443"} {
+		if err := c.dialControl("tcp", addr, nil); err != nil {
+			t.Errorf("%s 在允许内网时应放行: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"169.254.169.254:80", "[fe80::1]:443", "[fd00:ec2::254]:80"} {
+		if err := c.dialControl("tcp", addr, nil); err == nil {
+			t.Errorf("%s 是元数据地址，必须始终拦截", addr)
+		}
+	}
+}
+
+// TestResolveProviderKeepsRateLimit 盯住探测阶段的错误保真：真实 GitLab 被限流
+// 时不能报成「平台无法识别」。
+func TestResolveProviderKeepsRateLimit(t *testing.T) {
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v4/projects/") {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	sp := Spec{Provider: ProviderAuto, Path: "o/r", Origin: srv.URL}
+	if _, err := c.ResolveProvider(context.Background(), sp); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("期望 ErrRateLimited，得到 %v", err)
+	}
+}
+
+// TestResolveProviderLegacyGitLabURL 盯住 GitLab 旧链接：/group/sub/tree/main
+// 与 GHES 网页形态相同，必须靠探测识别成 GitLab，而不是直接拒绝。
+func TestResolveProviderLegacyGitLabURL(t *testing.T) {
+	var glHits int32
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v4/projects/") {
+			atomic.AddInt32(&glHits, 1)
+			_, _ = io.WriteString(w, `{"path":"sub","name":"Sub"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	sp, err := ParseRepoURLWithHosts("http://127.0.0.1/group/sub/tree/main", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("ParseRepoURLWithHosts: %v", err)
+	}
+	sp.Origin = srv.URL
+	got, err := c.ResolveProvider(context.Background(), sp)
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got.Provider != ProviderGitLab || got.Ref != "main" || glHits != 1 {
+		t.Errorf("旧链接应识别为 GitLab 并保留 ref，得到 %+v / hits=%d", got, glHits)
+	}
+}

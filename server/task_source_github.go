@@ -23,7 +23,9 @@ import (
 // =====================================================================
 // 仓库源码导入（任务创建流程的另一个入口）
 //
-// 支持 github.com 与 gitlab.com 的公开仓库。设计见 docs/github-source-import.md。
+// 支持 github.com 与 gitlab.com 的公开仓库，以及配置在 github_import.extra_hosts
+// 里的自建 GitLab / GitHub Enterprise（按 GitLab → GHES 自动探测）。设计见
+// docs/github-source-import.md。
 // 要点：导入产出与「上传 zip」完全相同的 staging 目录（data/uploads/<id>/source
 // + 一行 task_uploads），因此 createTask / attachUploadToTask / agent 提示词
 // 全都不需要改动。
@@ -60,7 +62,8 @@ func (s *Server) githubClient() *githubsrc.Client {
 	s.githubMu.Lock()
 	defer s.githubMu.Unlock()
 	if s.githubSrc == nil {
-		s.githubSrc = githubsrc.NewClient(config.GitHubSettings().Proxy)
+		cfg := config.GitHubSettings()
+		s.githubSrc = githubsrc.NewClient(cfg.Proxy, cfg.ExtraHosts, cfg.PrivateNetworkAllowed())
 	}
 	return s.githubSrc
 }
@@ -106,7 +109,7 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, 400, "请求格式不正确")
 		return
 	}
-	sp, err := githubsrc.ParseRepoURL(req.RepoURL)
+	sp, err := githubsrc.ParseRepoURLWithHosts(req.RepoURL, cfg.ExtraHosts)
 	if err != nil {
 		writeErr(w, 400, importGithubMessage(err))
 		return
@@ -124,6 +127,14 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 	// 「先建行、再发现要确认」的脏状态。
 	metaCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	// 自建主机先探测平台（GitLab → GitHub Enterprise）。探测结果按 origin 缓存，
+	// 后面的 Repo 会直接命中缓存，不会重复打上游。
+	sp, err = s.githubClient().ResolveProvider(metaCtx, sp)
+	if err != nil {
+		log.Printf("[github] %s 平台识别失败: %v", sp.String(), err)
+		writeErr(w, statusForImportError(err), importGithubMessage(err))
+		return
+	}
 	meta, err := s.githubClient().Repo(metaCtx, sp)
 	if err != nil {
 		log.Printf("[github] %s 元数据查询失败: %v", sp.String(), err)
@@ -226,7 +237,17 @@ func (s *Server) importTaskSourceGithub(w http.ResponseWriter, r *http.Request) 
 	if sp.Provider == githubsrc.ProviderGitLab {
 		jobCfg = unlimitedImport(cfg)
 	}
-	go s.runGithubImport(ctx, uploadID, sp, commit, meta.Name+"-", req.ConfirmLarge, jobCfg, job)
+	// 归档顶层目录名：codeload 是 {repo}-{ref}，GitHub Enterprise 的 zipball
+	// 是 {owner}-{repo}-{sha}，GitLab 是 {path}-{sha}-{sha}。
+	wrapper := meta.Name + "-"
+	if sp.Provider == githubsrc.ProviderGitHub && sp.Origin != "" {
+		owner := sp.Owner()
+		if i := strings.IndexByte(meta.FullName, '/'); i > 0 {
+			owner = meta.FullName[:i]
+		}
+		wrapper = owner + "-" + meta.Name + "-"
+	}
+	go s.runGithubImport(ctx, uploadID, sp, commit, wrapper, req.ConfirmLarge, jobCfg, job)
 
 	log.Printf("[github] %s ← %s@%s（估算 %.1f MB）", uploadID, sp.String(), shortSHA(commit), float64(estimate)/(1<<20))
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -575,6 +596,8 @@ func importGithubMessage(err error) string {
 		return "仓库为空，没有可审计的源码"
 	case errors.Is(err, githubsrc.ErrRepoBlocked):
 		return "该仓库已被平台以版权/合规原因屏蔽（HTTP 451），无法导入"
+	case errors.Is(err, githubsrc.ErrPlatformUnknown):
+		return "无法识别该代码托管平台（已尝试 GitLab 与 GitHub Enterprise），请确认地址或稍后重试"
 	case errors.Is(err, githubsrc.ErrRateLimited):
 		return "代码托管平台接口限流，请稍后重试"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -595,7 +618,8 @@ func statusForImportError(err error) int {
 	case errors.Is(err, githubsrc.ErrInvalidURL):
 		return 400
 	case errors.Is(err, githubsrc.ErrRepoNotFound), errors.Is(err, githubsrc.ErrRefNotFound),
-		errors.Is(err, githubsrc.ErrEmptyRepo), errors.Is(err, githubsrc.ErrRepoBlocked):
+		errors.Is(err, githubsrc.ErrEmptyRepo), errors.Is(err, githubsrc.ErrRepoBlocked),
+		errors.Is(err, githubsrc.ErrPlatformUnknown):
 		return 400
 	case errors.Is(err, githubsrc.ErrRateLimited):
 		return 429

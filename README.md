@@ -451,6 +451,36 @@ CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
 
 内置 CFR 的版本、来源与 SHA-1 记录在 [javadeps/tools/CFR-LICENSE.txt](javadeps/tools/CFR-LICENSE.txt)，其 MIT 许可证随 release 压缩包以 `CFR-LICENSE.txt` 分发。
 
+### 源码导入（GitHub / GitLab / 自建实例）
+
+新建任务时可以直接粘贴仓库地址，平台会解析出项目与 `ref`、固定到具体 commit，再下载归档：
+
+- `https://github.com/{owner}/{repo}`，或带分支的 `https://github.com/{owner}/{repo}/tree/{ref}`
+- `https://gitlab.com/{group}/{project}`，或带分支的 `.../-/tree/{ref}`
+- 也可以只填仓库根地址，在任务的「分支 / 标签 / commit」里单独指定
+
+**自建 GitLab / GitHub Enterprise** 只需在 `config.json` 里声明主机，不用写协议、端口或 API 路径：
+
+```json
+{
+  "github_import": {
+    "extra_hosts": ["gitlab.example.internal", "192.168.1.50"],
+    "allow_private_network": true
+  }
+}
+```
+
+声明后可直接粘贴 `http(s)://{host}/{group}/{project}` 或 `http(s)://{host}/{owner}/{repo}`。平台会在首次导入时自动探测：先按 GitLab `/api/v4`，失败再按 GitHub Enterprise `/api/v3`，结果按主机缓存 5 分钟。`allow_private_network` 默认为 `true`，允许访问内网地址；云元数据地址（`169.254.0.0/16`、`fe80::/10`、`fd00:ec2::254`）始终拦截。
+
+对应环境变量：`ARTEX_GITHUB_EXTRA_HOSTS`（逗号分隔）、`ARTEX_GITHUB_ALLOW_PRIVATE_NETWORK`。
+
+需要注意的边界：
+
+- 仅支持**公开仓库**（匿名访问，不配置 token），私有库会返回「仓库不存在或为私有」；
+- 自建实例需使用标准 API 路径（GitLab `/api/v4`、GHES `/api/v3`），子路径部署暂不支持；
+- 若归档下载会跳转到独立的对象存储 / CDN 域名，需要把该域名也加入 `extra_hosts`；
+- 归档不包含 submodule 内容与 Git LFS 实体；GitLab 不设体积上限，GitHub 侧默认 512 MiB 提示、4 GiB 硬上限，可通过 `github_import.*` 调整。
+
 ### 反向代理部署（HTTPS / 只开放 443）
 
 前端和 API/SSE 都由同一个后端端口（默认 `:7878`）提供，实时活动流默认走**同源**地址，因此**无需配置 `NEXT_PUBLIC_SSE_BASE`**，公网只开放 443、把 7878 留在内网即可。

@@ -3383,7 +3383,7 @@ function GithubSourceBox({ value, onChange }: { value: TaskUpload | null; onChan
         <Input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://github.com/owner/repo 或 https://gitlab.com/group/project"
+          placeholder="https://github.com/owner/repo、https://gitlab.com/group/project，或已配置的自建仓库地址"
           disabled={starting}
           aria-label="仓库地址"
         />

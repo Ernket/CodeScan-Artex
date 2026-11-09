@@ -41,6 +41,31 @@ func TestPostgresDSNPrecedence(t *testing.T) {
 	}
 }
 
+func TestGitHubSettingsExtraHosts(t *testing.T) {
+	t.Setenv("ARTEX_CONFIG", filepath.Join(t.TempDir(), "absent.json"))
+	for _, k := range []string{"ARTEX_GITHUB_EXTRA_HOSTS", "ARTEX_GITHUB_ALLOW_PRIVATE_NETWORK"} {
+		t.Setenv(k, "")
+	}
+
+	g := GitHubSettings()
+	if !g.PrivateNetworkAllowed() {
+		t.Error("默认应允许访问内网地址")
+	}
+	if len(g.ExtraHosts) != 0 {
+		t.Errorf("默认不应有自定义 host: %#v", g.ExtraHosts)
+	}
+
+	t.Setenv("ARTEX_GITHUB_EXTRA_HOSTS", "gitlab.corp.local, 192.168.1.50")
+	t.Setenv("ARTEX_GITHUB_ALLOW_PRIVATE_NETWORK", "0")
+	g = GitHubSettings()
+	if len(g.ExtraHosts) != 2 || g.ExtraHosts[0] != "gitlab.corp.local" || g.ExtraHosts[1] != "192.168.1.50" {
+		t.Errorf("extra hosts 解析不对: %#v", g.ExtraHosts)
+	}
+	if g.PrivateNetworkAllowed() {
+		t.Error("显式 0 应关闭内网访问")
+	}
+}
+
 // TestGitHubSettingsDefaultsAndEnv 覆盖导入限额的解析与「自愈」规则。
 //
 // 关键约束：配置写错不能把功能或进程带崩，只能被纠正。
